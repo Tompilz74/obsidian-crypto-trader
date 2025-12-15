@@ -3,17 +3,17 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 /**
  * OBSIDIAN CRYPTO TRADER — Phase 2A + 2B + 3 (Structure Engine)
  *
- * ✅ Live market snapshot (CoinGecko)
+ * ✅ Live market snapshot (CoinGecko) — via Netlify function proxy
  * ✅ Session Guard: daily commitment + auto STOP + manual END SESSION
  * ✅ Micro-journal + R-multiple trade logging
  *
  * Phase 2B:
  * ✅ Entry Quality Engine:
- *    - Flags EXTENDED / NO EDGE after violent moves (CoinGecko hourly 24h)
+ *    - Flags EXTENDED / NO EDGE after violent moves (CoinGecko hourly 24h) — via Netlify proxy
  *    - Shows “WHY NOT TRADE”
  *
  * Phase 3 (Structure Engine):
- * ✅ Binance 1h candles
+ * ✅ Binance 1h candles — via Netlify proxy
  * ✅ Support / resistance pivots (zoned)
  * ✅ Room-to-2R HARD BLOCK (NO EDGE if < 2R)
  * ✅ Clear labels (STRUCTURE: OK / WAIT / NO EDGE)
@@ -236,22 +236,16 @@ function computeSession(now: Date): SessionInfo {
   return { session, status, note, color, nextChangeAt, countdown };
 }
 
-/** CoinGecko markets snapshot */
+/** CoinGecko markets snapshot — via Netlify function proxy */
 async function fetchCoinGeckoMarkets(ids: string[]) {
   const url =
-    "https://api.coingecko.com/api/v3/coins/markets?" +
+    "/.netlify/functions/coingeckoMarkets?" +
     new URLSearchParams({
-      vs_currency: "usd",
       ids: ids.join(","),
-      order: "market_cap_desc",
-      per_page: "250",
-      page: "1",
-      sparkline: "false",
-      price_change_percentage: "24h",
     }).toString();
 
   const res = await fetch(url, { method: "GET" });
-  if (!res.ok) throw new Error(`CoinGecko error ${res.status}`);
+  if (!res.ok) throw new Error(`CoinGecko proxy error ${res.status}`);
   return (await res.json()) as Array<{
     id: string;
     symbol: string;
@@ -262,14 +256,14 @@ async function fetchCoinGeckoMarkets(ids: string[]) {
   }>;
 }
 
-/** Phase 2B: Hourly chart (24h) */
+/** Phase 2B: Hourly chart (24h) — via Netlify function proxy */
 async function fetchCoinGeckoHourly24h(coinId: string) {
   const url =
-    `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?` +
-    new URLSearchParams({ vs_currency: "usd", days: "1", interval: "hourly" }).toString();
+    "/.netlify/functions/coingeckoHourly?" +
+    new URLSearchParams({ id: coinId }).toString();
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`CoinGecko chart error ${res.status}`);
+  if (!res.ok) throw new Error(`CoinGecko hourly proxy error ${res.status}`);
   const data = (await res.json()) as { prices: [number, number][] };
   return data.prices.map((p) => p[1]).filter((x) => typeof x === "number" && isFinite(x));
 }
@@ -403,21 +397,22 @@ function saveDayState(st: DayState) {
   localStorage.setItem(LS_DAYSTATE, JSON.stringify(st));
 }
 
-/** ===== Phase 3: Binance structure ===== */
+/** ===== Phase 3: Binance structure (via Netlify function proxy) ===== */
 
 async function fetchBinance1hCandles(symbol: string, limit = 240): Promise<Candle1h[]> {
   const url =
-    "https://api.binance.com/api/v3/klines?" +
+    "/.netlify/functions/binanceKlines?" +
     new URLSearchParams({
-      symbol: `${symbol.toUpperCase()}USDT`,
+      symbol: symbol.toUpperCase(),
       interval: "1h",
       limit: String(limit),
     }).toString();
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance klines error ${res.status}`);
+  if (!res.ok) throw new Error(`Binance proxy error ${res.status}`);
   const data = (await res.json()) as any[];
 
+  // data is Binance kline array: [openTime, open, high, low, close, volume, ...]
   return data.map((k) => ({ h: Number(k[2]), l: Number(k[3]) })).filter((c) => isFinite(c.h) && isFinite(c.l));
 }
 
@@ -1245,9 +1240,7 @@ export default function App() {
     }
 
     const allowed = coinActionAllowed(s);
-    const blocked =
-      !overrideGuard &&
-      (s.entryQuality === "NO_EDGE" || s.structureLabel !== "OK");
+    const blocked = !overrideGuard && (s.entryQuality === "NO_EDGE" || s.structureLabel !== "OK");
 
     return (
       <div
@@ -1272,11 +1265,7 @@ export default function App() {
           position: "relative",
         }}
         title={
-          blocked
-            ? "Blocked: needs VALID + Structure OK"
-            : !tradingAllowed
-              ? "Trading locked (commit + session guard)"
-              : "Click to focus"
+          blocked ? "Blocked: needs VALID + Structure OK" : !tradingAllowed ? "Trading locked (commit + session guard)" : "Click to focus"
         }
       >
         {(s.entryQuality !== "VALID" || s.structureLabel !== "OK") && (
@@ -1287,16 +1276,14 @@ export default function App() {
               left: 6,
               fontSize: "0.7rem",
               fontWeight: 950,
-              color: (s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE") ? "#ffd1d1" : "#f2e7cd",
+              color: s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE" ? "#ffd1d1" : "#f2e7cd",
               background: "rgba(0,0,0,0.45)",
               border: "1px solid rgba(255,255,255,0.10)",
               borderRadius: 999,
               padding: "2px 8px",
             }}
           >
-            {s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE"
-              ? "NO EDGE"
-              : "WAIT"}
+            {s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE" ? "NO EDGE" : "WAIT"}
           </div>
         )}
 
@@ -1785,7 +1772,8 @@ export default function App() {
           </div>
 
           <div style={{ ...subtle, marginTop: 10 }}>
-            Focus: <b style={{ color: "#f2e7cd" }}>{focusSymbol}</b> · Tradable requires <b style={{ color: "#82f0b9" }}>VALID</b> + <b style={{ color: "#82f0b9" }}>Structure OK</b>.
+            Focus: <b style={{ color: "#f2e7cd" }}>{focusSymbol}</b> · Tradable requires <b style={{ color: "#82f0b9" }}>VALID</b> +{" "}
+            <b style={{ color: "#82f0b9" }}>Structure OK</b>.
           </div>
         </div>
 
@@ -1942,7 +1930,11 @@ export default function App() {
                     <b style={{ color: s.structureLabel === "OK" ? "#82f0b9" : s.structureLabel === "WAIT" ? "#f2e7cd" : "#ffb6b6" }}>
                       {s.structureLabel}
                     </b>
-                    {s.roomTo2R !== undefined && <> · Room <b style={{ color: "#f2e7cd" }}>{s.roomTo2R.toFixed(2)}R</b></>}
+                    {s.roomTo2R !== undefined && (
+                      <>
+                        {" · "}Room <b style={{ color: "#f2e7cd" }}>{s.roomTo2R.toFixed(2)}R</b>
+                      </>
+                    )}
                   </div>
 
                   <EntryQualityBadge s={s} />
