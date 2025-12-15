@@ -13,16 +13,12 @@ export const handler: Handler = async (event) => {
     }
 
     const url =
-      `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?` +
-      new URLSearchParams({
-        vs_currency: "usd",
-        days: "1",
-        interval: "hourly",
-      }).toString();
+  `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?` +
+  new URLSearchParams({
+    vs_currency: "usd",
+    days: "1", // keep 1; if it returns too few points, set to "2"
+  }).toString();
 
-    const res = await fetch(url, {
-      headers: { "User-Agent": "obsidian-terminal/1.0" },
-    });
 
     const text = await res.text();
 

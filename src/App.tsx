@@ -399,22 +399,22 @@ function saveDayState(st: DayState) {
 
 /** ===== Phase 3: Binance structure (via Netlify function proxy) ===== */
 
-async function fetchBinance1hCandles(symbol: string, limit = 240): Promise<Candle1h[]> {
+async function fetchCoinbase1hCandles(symbol: string, limit = 240): Promise<Candle1h[]> {
   const url =
-    "/.netlify/functions/binanceKlines?" +
+    "/.netlify/functions/coinbaseCandles?" +
     new URLSearchParams({
       symbol: symbol.toUpperCase(),
-      interval: "1h",
       limit: String(limit),
     }).toString();
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance proxy error ${res.status}`);
-  const data = (await res.json()) as any[];
+  if (!res.ok) throw new Error(`Coinbase function error ${res.status}`);
 
-  // data is Binance kline array: [openTime, open, high, low, close, volume, ...]
-  return data.map((k) => ({ h: Number(k[2]), l: Number(k[3]) })).filter((c) => isFinite(c.h) && isFinite(c.l));
+  const data = (await res.json()) as { candles: Candle1h[] };
+  if (!data?.candles?.length) throw new Error("No candles returned from Coinbase function");
+  return data.candles;
 }
+
 
 function computePivotLevels1h(candles: Candle1h[]) {
   const supports: number[] = [];
@@ -738,7 +738,8 @@ export default function App() {
             }
 
             try {
-              const candles = await fetchBinance1hCandles(x.symbol, 240);
+              const candles = await fetchCoinbase1hCandles(x.symbol, 240);
+
               const levels = computePivotLevels1h(candles);
               const res = evaluateStructure(price, levels);
               return [x.symbol, res] as const;
