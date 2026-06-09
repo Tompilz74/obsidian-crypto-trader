@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * OBSIDIAN CRYPTO TRADER — Phase 2A + 2B + 3 (Structure Engine)
@@ -13,14 +13,15 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  *    - Shows “WHY NOT TRADE”
  *
  * Phase 3 (Structure Engine):
- * ✅ Binance 1h candles — via Netlify proxy
+ * ✅ Coinbase 1h candles — via Netlify proxy
  * ✅ Support / resistance pivots (zoned)
  * ✅ Room-to-2R HARD BLOCK (NO EDGE if < 2R)
  * ✅ Clear labels (STRUCTURE: OK / WAIT / NO EDGE)
  */
 
-type TabKey = "dashboard" | "scanner" | "journal" | "history";
+type TabKey = "dashboard" | "scanner" | "journal" | "history" | "plan" | "simulator" | "accuracy" | "pro";
 type SessionStatus = "TRADE" | "SELECTIVE" | "WAIT";
+type TradeSide = "LONG" | "SHORT";
 
 type MarketRow = {
   symbol: string;
@@ -80,12 +81,13 @@ type CommitConfig = {
   allowOverlap: boolean;
   allowOffPeak: boolean;
 };
+type CommitSessionKey = "allowAsia" | "allowEurope" | "allowUS" | "allowOverlap" | "allowOffPeak";
 
 type TradeRecord = {
   id: string;
   tsIso: string;
   symbol: string;
-  side: "LONG" | "SHORT";
+  side: TradeSide;
   entry: number;
   stop: number;
   exit: number;
@@ -99,6 +101,128 @@ type DayState = {
   locked: boolean;
   lockedReason?: string;
   trades: TradeRecord[];
+};
+
+type SimPosition = {
+  id: string;
+  openedAtIso: string;
+  symbol: string;
+  side: TradeSide;
+  entry: number;
+  qty: number;
+  notionalUsd: number;
+  stop?: number;
+  takeProfit?: number;
+  thesis?: string;
+  source: string;
+};
+
+type SimClosedTrade = SimPosition & {
+  closedAtIso: string;
+  exit: number;
+  pnlUsd: number;
+  pnlPct: number;
+};
+
+type SimState = {
+  startedAtIso: string;
+  startingCashUsd: number;
+  cashUsd: number;
+  positions: SimPosition[];
+  history: SimClosedTrade[];
+};
+
+type GoalPeriod = "day" | "week" | "month";
+type StrategyProfile = "Scalp" | "Day Trade" | "Swing" | "Capital Defense";
+
+type GoalPlanDraft = {
+  goalName: string;
+  targetReturnPct: number;
+  targetPeriod: GoalPeriod;
+  startingEquityUsd: number;
+  maxDailyLossPct: number;
+  maxTradesPerDay: number;
+  maxOpenPositions: number;
+  riskPerTradePct: number;
+  minConfidence: number;
+  notes: string;
+};
+
+type GoalPlan = GoalPlanDraft & {
+  id: string;
+  createdAtIso: string;
+  acceptedAtIso: string;
+  horizonDays: number;
+  dailyTargetPct: number;
+  strategyProfile: StrategyProfile;
+  requiredWinRatePct: number;
+  acceptedRisk: true;
+};
+type GoalPlanNumberKey = Exclude<keyof GoalPlanDraft, "goalName" | "notes" | "targetPeriod">;
+const GOAL_PLAN_NUMBER_KEYS: GoalPlanNumberKey[] = [
+  "targetReturnPct",
+  "startingEquityUsd",
+  "maxDailyLossPct",
+  "maxTradesPerDay",
+  "maxOpenPositions",
+  "riskPerTradePct",
+  "minConfidence",
+];
+
+type AiTradeIdea = {
+  symbol: string;
+  action: "BUY_TEST" | "WATCH" | "HOLD" | "SELL" | "AVOID";
+  confidence: number;
+  thesis: string;
+  planFit: string;
+  entryZone: string;
+  stop: string;
+  target: string;
+  holdTime: string;
+  allocationUsd: number;
+  reasons: string[];
+  warnings: string[];
+};
+
+type AiAdvisorResponse = {
+  generatedAtIso?: string;
+  model?: string;
+  marketBrief: {
+    headline: string;
+    regime: string;
+    summary: string;
+    catalysts: string[];
+    sources: { title: string; url: string }[];
+    risks: string[];
+    avoid: string[];
+  };
+  tradeIdeas: AiTradeIdea[];
+  portfolioReview: {
+    summary: string;
+    actions: string[];
+    holdings: {
+      symbol: string;
+      action: "SELL" | "HOLD" | "REDUCE" | "INCREASE" | "FREE_CAPITAL";
+      confidence: number;
+      reason: string;
+      goalImpact: string;
+      replacementIdea: string;
+    }[];
+  };
+  disclaimer: string;
+};
+
+type AiSignalRecord = {
+  id: string;
+  tsIso: string;
+  symbol: string;
+  action: string;
+  confidence: number;
+  entry: number;
+  score: number;
+  verdict?: "WIN" | "LOSS" | "OPEN";
+  checkedAtIso?: string;
+  resultPct?: number;
 };
 
 type MicroMetrics = {
@@ -231,7 +355,7 @@ function computeSession(now: Date): SessionInfo {
     nextChangeAt = curMinutes < B_ASIA ? makeNext(7, 0, 0) : makeNext(16, 0, 0);
   }
 
-  const color = status === "TRADE" ? "#82f0b9" : status === "SELECTIVE" ? "#f2e7cd" : "#ffb6b6";
+  const color = status === "TRADE" ? "#047857" : status === "SELECTIVE" ? "#111827" : "#b91c1c";
   const countdown = msToCountdown(nextChangeAt.getTime() - now.getTime());
   return { session, status, note, color, nextChangeAt, countdown };
 }
@@ -351,6 +475,22 @@ function computeR(side: "LONG" | "SHORT", entry: number, stop: number, exit: num
 /** Local persistence */
 const LS_COMMIT = "ob:commit";
 const LS_DAYSTATE = "ob:daystate";
+const LS_PRO_PASS = "ob:pro-pass";
+const LS_LEADS = "ob:leads";
+const LS_SIM = "ob:simulator";
+const LS_GOAL_PLAN = "ob:goal-plan";
+const LS_AI_SIGNALS = "ob:ai-signals";
+const CHECKOUT_URL =
+  (import.meta.env.VITE_CHECKOUT_URL as string | undefined) ||
+  "mailto:you@example.com?subject=Obsidian%20Pro%20access&body=I%20want%20Obsidian%20Crypto%20Trader%20Pro.";
+const PRO_PRICE = "$29/mo";
+const COMMIT_SESSION_OPTIONS: Array<[CommitSessionKey, string]> = [
+  ["allowAsia", "Asia"],
+  ["allowEurope", "Europe"],
+  ["allowOverlap", "Europe+US overlap"],
+  ["allowUS", "US"],
+  ["allowOffPeak", "Off-peak"],
+];
 
 function loadCommit(dayKey: string): CommitConfig | null {
   try {
@@ -397,7 +537,181 @@ function saveDayState(st: DayState) {
   localStorage.setItem(LS_DAYSTATE, JSON.stringify(st));
 }
 
-/** ===== Phase 3: Binance structure (via Netlify function proxy) ===== */
+function defaultSimState(): SimState {
+  return { startedAtIso: new Date().toISOString(), startingCashUsd: 10000, cashUsd: 10000, positions: [], history: [] };
+}
+
+function loadSimState(): SimState {
+  try {
+    const raw = localStorage.getItem(LS_SIM);
+    if (!raw) return defaultSimState();
+    const parsed = JSON.parse(raw) as SimState;
+    if (!parsed || typeof parsed.cashUsd !== "number" || !Array.isArray(parsed.positions) || !Array.isArray(parsed.history)) {
+      return defaultSimState();
+    }
+    return { ...parsed, startedAtIso: parsed.startedAtIso ?? new Date().toISOString() };
+  } catch {
+    return defaultSimState();
+  }
+}
+
+function saveSimState(st: SimState) {
+  localStorage.setItem(LS_SIM, JSON.stringify(st));
+}
+
+function goalPeriodDays(period: GoalPeriod) {
+  if (period === "day") return 1;
+  if (period === "week") return 7;
+  return 30;
+}
+
+function strategyFromGoal(targetReturnPct: number, targetPeriod: GoalPeriod): {
+  profile: StrategyProfile;
+  dailyTargetPct: number;
+  maxDailyLossPct: number;
+  maxTradesPerDay: number;
+  maxOpenPositions: number;
+  riskPerTradePct: number;
+  minConfidence: number;
+  notes: string;
+} {
+  const horizonDays = goalPeriodDays(targetPeriod);
+  const dailyTargetPct = targetReturnPct / horizonDays;
+
+  if (dailyTargetPct >= 2) {
+    return {
+      profile: "Scalp",
+      dailyTargetPct,
+      maxDailyLossPct: Math.min(2, Math.max(1, dailyTargetPct * 0.55)),
+      maxTradesPerDay: 4,
+      maxOpenPositions: 1,
+      riskPerTradePct: 0.75,
+      minConfidence: 82,
+      notes: "Aggressive target. Use only the cleanest scanner setups, take smaller size, and stop quickly if the first trades fail.",
+    };
+  }
+
+  if (dailyTargetPct >= 0.65) {
+    return {
+      profile: "Day Trade",
+      dailyTargetPct,
+      maxDailyLossPct: Math.min(1.5, Math.max(0.75, dailyTargetPct * 0.75)),
+      maxTradesPerDay: 3,
+      maxOpenPositions: 2,
+      riskPerTradePct: 1,
+      minConfidence: 76,
+      notes: "Active day-trading target. Focus on VALID timing, Structure OK, and avoid adding after a losing entry.",
+    };
+  }
+
+  if (dailyTargetPct >= 0.15) {
+    return {
+      profile: "Swing",
+      dailyTargetPct,
+      maxDailyLossPct: 0.8,
+      maxTradesPerDay: 2,
+      maxOpenPositions: 3,
+      riskPerTradePct: 1.25,
+      minConfidence: 72,
+      notes: "Moderate goal. Allow fewer, higher-quality trades and let winners work longer instead of forcing daily action.",
+    };
+  }
+
+  return {
+    profile: "Capital Defense",
+    dailyTargetPct,
+    maxDailyLossPct: 0.5,
+    maxTradesPerDay: 1,
+    maxOpenPositions: 2,
+    riskPerTradePct: 0.75,
+    minConfidence: 78,
+    notes: "Low daily target. Protect cash, wait for strict signals, and prioritize drawdown control.",
+  };
+}
+
+function defaultGoalPlanDraft(startingEquityUsd = 10000): GoalPlanDraft {
+  const strategy = strategyFromGoal(3, "day");
+  return {
+    goalName: "3% daily profit challenge",
+    targetReturnPct: 3,
+    targetPeriod: "day",
+    startingEquityUsd,
+    maxDailyLossPct: strategy.maxDailyLossPct,
+    maxTradesPerDay: strategy.maxTradesPerDay,
+    maxOpenPositions: strategy.maxOpenPositions,
+    riskPerTradePct: strategy.riskPerTradePct,
+    minConfidence: strategy.minConfidence,
+    notes: strategy.notes,
+  };
+}
+
+function loadGoalPlan(): GoalPlan | null {
+  try {
+    const raw = localStorage.getItem(LS_GOAL_PLAN);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as GoalPlan & { horizonDays?: number; targetPeriod?: GoalPeriod };
+    if (!parsed || !parsed.acceptedRisk || typeof parsed.targetReturnPct !== "number") return null;
+    const targetPeriod: GoalPeriod =
+      parsed.targetPeriod === "day" || parsed.targetPeriod === "week" || parsed.targetPeriod === "month"
+        ? parsed.targetPeriod
+        : (parsed.horizonDays ?? 1) <= 1
+          ? "day"
+          : (parsed.horizonDays ?? 7) <= 7
+            ? "week"
+            : "month";
+    const horizonDays = goalPeriodDays(targetPeriod);
+    const strategy = strategyFromGoal(parsed.targetReturnPct, targetPeriod);
+    return {
+      ...parsed,
+      targetPeriod,
+      horizonDays,
+      dailyTargetPct: parsed.dailyTargetPct ?? strategy.dailyTargetPct,
+      strategyProfile: parsed.strategyProfile ?? strategy.profile,
+      requiredWinRatePct: parsed.requiredWinRatePct ?? clamp(48 + parsed.targetReturnPct * 6 - parsed.riskPerTradePct * 3, 35, 88),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveGoalPlan(plan: GoalPlan | null) {
+  if (!plan) localStorage.removeItem(LS_GOAL_PLAN);
+  else localStorage.setItem(LS_GOAL_PLAN, JSON.stringify(plan));
+}
+
+function goalPlanNumberText(draft: GoalPlanDraft): Record<GoalPlanNumberKey, string> {
+  return GOAL_PLAN_NUMBER_KEYS.reduce(
+    (acc, key) => ({ ...acc, [key]: String(draft[key]) }),
+    {} as Record<GoalPlanNumberKey, string>
+  );
+}
+
+function loadProPass() {
+  try {
+    return localStorage.getItem(LS_PRO_PASS) === "active";
+  } catch {
+    return false;
+  }
+}
+
+function loadAiSignals(): AiSignalRecord[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LS_AI_SIGNALS) || "[]") as AiSignalRecord[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAiSignals(signals: AiSignalRecord[]) {
+  localStorage.setItem(LS_AI_SIGNALS, JSON.stringify(signals.slice(0, 500)));
+}
+
+function getErrorMessage(e: unknown, fallback: string) {
+  return e instanceof Error ? e.message : fallback;
+}
+
+/** ===== Phase 3: Coinbase structure (via Netlify function proxy) ===== */
 
 async function fetchCoinbase1hCandles(symbol: string, limit = 240): Promise<Candle1h[]> {
   const url =
@@ -613,8 +927,16 @@ export default function App() {
 
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [overrideGuard, setOverrideGuard] = useState(false);
+  const [proPass, setProPass] = useState(() => loadProPass());
+  const [leadEmail, setLeadEmail] = useState("");
+  const [leadSaved, setLeadSaved] = useState(false);
+  const [aiAdvisor, setAiAdvisor] = useState<AiAdvisorResponse | null>(null);
+  const [aiAdvisorLoading, setAiAdvisorLoading] = useState(false);
+  const [aiAdvisorError, setAiAdvisorError] = useState<string | null>(null);
+  const [aiSignals, setAiSignals] = useState<AiSignalRecord[]>(() => loadAiSignals());
+  const [liveNewsMode, setLiveNewsMode] = useState(false);
 
-  const [clockTick, setClockTick] = useState(0);
+  const [, setClockTick] = useState(0);
 
   const [market, setMarket] = useState<MarketRow[]>([]);
   const [microMap, setMicroMap] = useState<MicroMap>({});
@@ -627,17 +949,33 @@ export default function App() {
   const [riskPct, setRiskPct] = useState(2);
   const [entryPrice, setEntryPrice] = useState<number>(0);
   const [stopPrice, setStopPrice] = useState<number>(0);
+  const [simState, setSimState] = useState<SimState>(() => loadSimState());
+  const [goalPlan, setGoalPlan] = useState<GoalPlan | null>(() => loadGoalPlan());
+  const [goalPlanDraft, setGoalPlanDraft] = useState<GoalPlanDraft>(() => {
+    const active = loadGoalPlan();
+    if (active) {
+      const { goalName, targetReturnPct, targetPeriod, startingEquityUsd, maxDailyLossPct, maxTradesPerDay, maxOpenPositions, riskPerTradePct, minConfidence, notes } = active;
+      return { goalName, targetReturnPct, targetPeriod, startingEquityUsd, maxDailyLossPct, maxTradesPerDay, maxOpenPositions, riskPerTradePct, minConfidence, notes };
+    }
+    return defaultGoalPlanDraft(loadSimState().startingCashUsd);
+  });
+  const [goalPlanInputText, setGoalPlanInputText] = useState<Record<GoalPlanNumberKey, string>>(() => goalPlanNumberText(goalPlanDraft));
+  const [goalRiskAccepted, setGoalRiskAccepted] = useState(false);
+  const [simSymbol, setSimSymbol] = useState("SOL");
+  const [simCoinSearch, setSimCoinSearch] = useState("");
+  const [simBuyUsd, setSimBuyUsd] = useState("250");
+  const [simThesis, setSimThesis] = useState("");
 
   // Trade logging modal state
   const [logOpen, setLogOpen] = useState(false);
-  const [logSide, setLogSide] = useState<"LONG" | "SHORT">("LONG");
+  const [logSide, setLogSide] = useState<TradeSide>("LONG");
   const [logEntry, setLogEntry] = useState<number>(0);
   const [logStop, setLogStop] = useState<number>(0);
   const [logExit, setLogExit] = useState<number>(0);
   const [logRulesFollowed, setLogRulesFollowed] = useState(true);
   const [logNote, setLogNote] = useState("");
 
-  const todayKey = useMemo(() => dayKeyLocal(new Date()), [clockTick]);
+  const todayKey = dayKeyLocal(new Date());
   const [commit, setCommit] = useState<CommitConfig | null>(() => loadCommit(dayKeyLocal(new Date())));
   const [dayState, setDayState] = useState<DayState>(() => loadDayState(dayKeyLocal(new Date())));
 
@@ -653,14 +991,14 @@ export default function App() {
   }, [todayKey]);
 
   useEffect(() => saveDayState(dayState), [dayState]);
+  useEffect(() => saveSimState(simState), [simState]);
+  useEffect(() => saveGoalPlan(goalPlan), [goalPlan]);
+  useEffect(() => saveAiSignals(aiSignals), [aiSignals]);
 
   useInterval(() => setClockTick((x) => x + 1), 1000);
 
-  const localTime = useMemo(
-    () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    [clockTick]
-  );
-  const sessionInfo = useMemo(() => computeSession(new Date()), [clockTick]);
+  const localTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const sessionInfo = computeSession(new Date());
 
   const coinIds = useMemo(() => COINS.map((c) => c.cgId).filter(Boolean) as string[], []);
 
@@ -725,7 +1063,7 @@ export default function App() {
         // keep previous microMap if chart calls fail
       }
 
-      // ---- Phase 3: structure engine (Binance 1h) for TOP candidates only
+      // ---- Phase 3: structure engine (Coinbase 1h) for TOP candidates only
       try {
         const structPairs = await Promise.all(
           rankedTemp.map(async (x) => {
@@ -749,7 +1087,7 @@ export default function App() {
                 {
                   ok: false,
                   label: "WAIT",
-                  reasons: ["Structure unavailable (Binance pair missing)."],
+                  reasons: ["Structure unavailable (Coinbase pair missing)."],
                   source: "MISSING",
                 } as StructureResult,
               ] as const;
@@ -763,8 +1101,8 @@ export default function App() {
       } catch {
         // keep previous structMap
       }
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to fetch market data.");
+    } catch (e: unknown) {
+      setError(getErrorMessage(e, "Failed to fetch market data."));
     } finally {
       setIsLoading(false);
     }
@@ -810,7 +1148,7 @@ export default function App() {
   // Trade allowed logic:
   const tradingAllowed = useMemo(() => {
     if (commitRequired) return false;
-    if (dayState.locked) return false;
+    if (dayState.locked && !overrideGuard) return false;
 
     const waitBlocks = sessionInfo.status === "WAIT" && !overrideGuard;
     const commitBlocks = !sessionAllowedByCommit && !overrideGuard;
@@ -857,13 +1195,25 @@ export default function App() {
   }, [commit, todayKey]);
 
   // Search filter
+  const marketUniverse = useMemo<MarketRow[]>(
+    () =>
+      market.length
+        ? market
+        : COINS.map((c) => ({
+            symbol: c.symbol.toUpperCase(),
+            cgId: c.cgId,
+            name: c.name,
+          })),
+    [market]
+  );
+
   const filteredMarket = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return market;
-    return market.filter(
+    if (!q) return marketUniverse;
+    return marketUniverse.filter(
       (m) => (m.symbol ?? "").toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)
     );
-  }, [market, query]);
+  }, [marketUniverse, query]);
 
   const baselineVol = useMemo(() => {
     const vols = filteredMarket
@@ -922,6 +1272,23 @@ export default function App() {
 
   const bestSetup = scannerBest[0] ?? setups[0];
 
+  const blockedSetups = useMemo(
+    () => setups.filter((s) => s.entryQuality !== "VALID" || s.structureLabel !== "OK"),
+    [setups]
+  );
+  const watchlistHealth = useMemo(() => {
+    const tradable = scannerBest.length;
+    const scanned = setups.length;
+    const blocked = blockedSetups.length;
+    const avgScore = scanned ? setups.reduce((acc, s) => acc + s.combinedScore, 0) / scanned : 0;
+    return { tradable, scanned, blocked, avgScore };
+  }, [blockedSetups.length, scannerBest.length, setups]);
+  const edgeGrade = useMemo(() => {
+    if (scannerBest.length >= 3) return { label: "HOT", color: "#047857", note: "Multiple strict candidates. Pick one, size small." };
+    if (scannerBest.length >= 1) return { label: "SELECTIVE", color: "#111827", note: "One or two candidates. Demand clean execution." };
+    return { label: "COLD", color: "#b91c1c", note: "No strict edge. Waiting is the trade." };
+  }, [scannerBest.length]);
+
   // Position sizing / TP SL
   const riskAmount = useMemo(() => (accountUsd * riskPct) / 100, [accountUsd, riskPct]);
   const stopDistanceLong = useMemo(() => Math.max(0, entryPrice - stopPrice), [entryPrice, stopPrice]);
@@ -940,6 +1307,616 @@ export default function App() {
   const tp1Short = useMemo(() => (stopDistanceShort > 0 ? entryPrice - stopDistanceShort * 1 : 0), [entryPrice, stopDistanceShort]);
   const tp2Short = useMemo(() => (stopDistanceShort > 0 ? entryPrice - stopDistanceShort * 2 : 0), [entryPrice, stopDistanceShort]);
 
+  const getSimPrice = useCallback((symbol: string) => {
+    const live = market.find((m) => m.symbol === symbol)?.priceUsd;
+    if (typeof live === "number" && isFinite(live)) return live;
+    if (symbol === focusSymbol && entryPrice > 0) return entryPrice;
+    return 0;
+  }, [entryPrice, focusSymbol, market]);
+
+  const simSelectedSetup = setups.find((s) => s.symbol === simSymbol);
+  const simulatorPrice = getSimPrice(simSymbol) || simSelectedSetup?.priceUsd || 0;
+  const simCanBuySelected = simulatorPrice > 0 && isFinite(simulatorPrice);
+  const simCoinChoices = useMemo(() => {
+    const q = simCoinSearch.trim().toLowerCase();
+    const base = setups.length ? setups : COINS.map((c) => ({
+      symbol: c.symbol,
+      priceUsd: undefined,
+      change24h: undefined,
+      combinedScore: 0,
+      score15m: 0,
+      score1h: 0,
+      volFactor: 0,
+      why: [],
+      entryQuality: "VALID" as const,
+      whyNot: [],
+      structureLabel: "WAIT" as const,
+      structureWhy: ["Live scanner data loading."],
+      structureSource: "MISSING" as const,
+    }));
+    return base.filter((s) => !q || s.symbol.toLowerCase().includes(q));
+  }, [setups, simCoinSearch]);
+  const simOpenPnl = simState.positions.reduce((acc, p) => {
+    const price = getSimPrice(p.symbol) || p.entry;
+    const pnl = (price - p.entry) * p.qty;
+    return acc + pnl;
+  }, 0);
+  const simEquity = simState.cashUsd + simState.positions.reduce((acc, p) => acc + p.notionalUsd, 0) + simOpenPnl;
+  const simRealizedPnl = simState.history.reduce((acc, t) => acc + t.pnlUsd, 0);
+  const simReturnPct = ((simEquity - simState.startingCashUsd) / simState.startingCashUsd) * 100;
+  const simElapsedDays = Math.max(0, (Date.now() - new Date(simState.startedAtIso).getTime()) / (24 * 60 * 60 * 1000));
+  const simChallengeDay = Math.min(7, Math.floor(simElapsedDays) + 1);
+  const simDaysLeft = Math.max(0, 7 - simElapsedDays);
+  const simSelectedHolding = simState.positions.find((p) => p.symbol === simSymbol);
+  const simSelectedHoldingPnl = simSelectedHolding
+    ? ((getSimPrice(simSelectedHolding.symbol) || simSelectedHolding.entry) - simSelectedHolding.entry) * simSelectedHolding.qty
+    : 0;
+  const simStats = useMemo(() => {
+    const wins = simState.history.filter((t) => t.pnlUsd > 0);
+    const losses = simState.history.filter((t) => t.pnlUsd < 0);
+    const winRate = simState.history.length ? (wins.length / simState.history.length) * 100 : 0;
+    const avgWinPct = wins.length ? wins.reduce((acc, t) => acc + t.pnlPct, 0) / wins.length : 0;
+    const avgLossPct = losses.length ? Math.abs(losses.reduce((acc, t) => acc + t.pnlPct, 0) / losses.length) : 0;
+    const expectancyPct = simState.history.length ? simState.history.reduce((acc, t) => acc + t.pnlPct, 0) / simState.history.length : 0;
+    const payoffRatio = avgLossPct > 0 ? avgWinPct / avgLossPct : avgWinPct > 0 ? 99 : 0;
+    return { wins: wins.length, losses: losses.length, winRate, avgWinPct, avgLossPct, expectancyPct, payoffRatio };
+  }, [simState.history]);
+
+  const signalCalibration = useMemo(() => {
+    const checked = aiSignals.map((s) => {
+      const now = getSimPrice(s.symbol);
+      const resultPct = now && s.entry ? ((now - s.entry) / s.entry) * 100 : s.resultPct;
+      const verdict = typeof resultPct === "number" ? (resultPct > 0.35 ? "WIN" : resultPct < -0.35 ? "LOSS" : "OPEN") : (s.verdict ?? "OPEN");
+      return { ...s, resultPct, verdict };
+    });
+    const resolved = checked.filter((s) => s.verdict === "WIN" || s.verdict === "LOSS");
+    const wins = resolved.filter((s) => s.verdict === "WIN").length;
+    const winRate = resolved.length ? (wins / resolved.length) * 100 : 0;
+    const avgConfidence = resolved.length ? resolved.reduce((acc, s) => acc + s.confidence, 0) / resolved.length : 0;
+    const confidenceGap = resolved.length ? avgConfidence - winRate : 0;
+    const adjustment = resolved.length >= 5 ? clamp(-confidenceGap * 0.35, -16, 8) : simStats.expectancyPct < 0 ? -5 : 0;
+    const buckets = [60, 70, 80, 90].map((floor) => {
+      const bucket = resolved.filter((s) => s.confidence >= floor && s.confidence < floor + 10);
+      const bucketWins = bucket.filter((s) => s.verdict === "WIN").length;
+      return { floor, count: bucket.length, winRate: bucket.length ? (bucketWins / bucket.length) * 100 : 0 };
+    });
+    return { checked, resolved, wins, winRate, avgConfidence, confidenceGap, adjustment, buckets };
+  }, [aiSignals, getSimPrice, simStats.expectancyPct]);
+
+  const scannerReplay = useMemo(() => {
+    const rows = setups
+      .filter((s) => typeof s.priceUsd === "number")
+      .slice(0, 24)
+      .map((s) => {
+        const micro = microMap[s.symbol];
+        const strict = s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70;
+        const proxyReturnPct = micro?.ret4h ?? (s.change24h ?? 0) * 0.18;
+        const afterCostsPct = proxyReturnPct - 0.28;
+        const result = strict ? afterCostsPct : 0;
+        return { symbol: s.symbol, strict, score: s.combinedScore, proxyReturnPct, afterCostsPct, result };
+      });
+    const trades = rows.filter((r) => r.strict);
+    const wins = trades.filter((r) => r.result > 0).length;
+    const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+    const expectancyPct = trades.length ? trades.reduce((acc, r) => acc + r.result, 0) / trades.length : 0;
+    const best = [...trades].sort((a, b) => b.result - a.result)[0];
+    const worst = [...trades].sort((a, b) => a.result - b.result)[0];
+    return { rows, trades, wins, winRate, expectancyPct, best, worst };
+  }, [microMap, setups]);
+
+  const planProgress = useMemo(() => {
+    const targetReturnPct = goalPlan?.targetReturnPct ?? 3;
+    const horizonDays = Math.max(1, goalPlan?.horizonDays ?? 7);
+    const maxDailyLossPct = goalPlan?.maxDailyLossPct ?? 1.5;
+    const basis = goalPlan?.startingEquityUsd ?? simState.startingCashUsd;
+    const targetUsd = basis * (targetReturnPct / 100);
+    const maxLossUsd = basis * (maxDailyLossPct / 100);
+    const pnlUsd = simEquity - simState.startingCashUsd;
+    const progressPct = targetUsd > 0 ? clamp((pnlUsd / targetUsd) * 100, -100, 200) : 0;
+    const lossUsedPct = maxLossUsd > 0 ? clamp((Math.max(0, -pnlUsd) / maxLossUsd) * 100, 0, 200) : 0;
+    const dailyTargetUsd = targetUsd / horizonDays;
+    const status =
+      pnlUsd >= targetUsd
+        ? "GOAL HIT"
+        : -pnlUsd >= maxLossUsd
+          ? "STOP HIT"
+          : progressPct >= 70
+            ? "NEAR GOAL"
+            : "ACTIVE";
+    return { targetReturnPct, horizonDays, maxDailyLossPct, basis, targetUsd, maxLossUsd, pnlUsd, progressPct, lossUsedPct, dailyTargetUsd, status };
+  }, [goalPlan, simEquity, simState.startingCashUsd]);
+
+  const advancedAi = useMemo(() => {
+    const score = simSelectedSetup?.combinedScore ?? 0;
+    const entryOk = simSelectedSetup?.entryQuality === "VALID";
+    const structureOk = simSelectedSetup?.structureLabel === "OK";
+    const hasPrice = simCanBuySelected;
+    const minConfidence = goalPlan?.minConfidence ?? 70;
+    const maxOpenPositions = goalPlan?.maxOpenPositions ?? 3;
+    const maxDailyLossPct = goalPlan?.maxDailyLossPct ?? 3;
+    const tradablePressure = watchlistHealth.scanned ? watchlistHealth.tradable / watchlistHealth.scanned : 0;
+    const rawConfidence = clamp(
+      Math.round(score * 0.46 + (entryOk ? 18 : -14) + (structureOk ? 20 : -18) + tradablePressure * 12 + (hasPrice ? 4 : 0)),
+      0,
+      100
+    );
+    const confidence = clamp(Math.round(rawConfidence + signalCalibration.adjustment), 0, 100);
+    const marketRegime =
+      watchlistHealth.tradable >= 3 && watchlistHealth.avgScore >= 62
+        ? "MOMENTUM"
+        : watchlistHealth.tradable >= 1
+          ? "SELECTIVE"
+          : "DEFENSIVE";
+    const feeDragPct = 0.28;
+    const structureBonus = structureOk ? 0.45 : -0.75;
+    const entryBonus = entryOk ? 0.35 : -0.65;
+    const scannerEdgePct = clamp((score - 62) * 0.055 + structureBonus + entryBonus - feeDragPct, -2.5, 4.5);
+    const estimatedMovePct = clamp(Math.max(0.35, Math.abs(simSelectedSetup?.change24h ?? 0) * 0.18), 0.35, 3.6);
+    const stopPct = clamp(estimatedMovePct * 0.55, 0.55, 2.4);
+    const targetPct = clamp(stopPct * 2.05, 1.15, 5.5);
+    const requiredWinRate = clamp((stopPct + feeDragPct) / (targetPct + stopPct) * 100, 18, 68);
+    const drawdownPct = ((simEquity - simState.startingCashUsd) / simState.startingCashUsd) * 100;
+    const riskState =
+      drawdownPct <= -Math.abs(maxDailyLossPct)
+        ? "RED"
+        : drawdownPct <= -Math.abs(maxDailyLossPct) * 0.5 || simState.positions.length >= maxOpenPositions
+          ? "YELLOW"
+          : "GREEN";
+    const baseRiskPctOfEquity = goalPlan?.riskPerTradePct ?? (confidence >= 82 ? 4 : confidence >= 72 ? 2.5 : 1);
+    const riskPctOfEquity = riskState === "RED" ? 0 : riskState === "YELLOW" ? Math.min(baseRiskPctOfEquity, 1.25) : baseRiskPctOfEquity;
+    const riskBudgetUsd = Math.round(simEquity * (riskPctOfEquity / 100));
+    const maxTradeUsd = Math.max(0, Math.min(simState.cashUsd, riskBudgetUsd));
+    const blockers: string[] = [];
+    if (!goalPlan) blockers.push("No accepted goal plan yet. Create one in Plan before letting AI size trades.");
+    if (planProgress.status === "GOAL HIT") blockers.push("Goal target already hit. Protect the result instead of forcing more trades.");
+    if (planProgress.status === "STOP HIT") blockers.push("Plan loss cap is hit. Stop trading and review.");
+    if (!hasPrice) blockers.push("No live price available for this coin.");
+    if (!entryOk) blockers.push("Entry quality is not valid; avoid chasing or catching a fast dump.");
+    if (!structureOk) blockers.push("Structure does not have a clean 2R map.");
+    if (confidence < minConfidence) blockers.push(`AI confidence is below your plan minimum of ${minConfidence}%.`);
+    if (riskState === "RED") blockers.push("Simulator drawdown guard is active; stop trading and review.");
+    if (simState.positions.length >= maxOpenPositions) blockers.push(`Plan allows only ${maxOpenPositions} open sim holding${maxOpenPositions === 1 ? "" : "s"}.`);
+    if (simSelectedHolding && simSelectedHoldingPnl < 0) blockers.push(`Already holding losing ${simSymbol}; do not average down.`);
+    const shouldTrade = blockers.length === 0 && scannerEdgePct > 0.2;
+    const executionRules = [
+      goalPlan ? `${goalPlan.strategyProfile}: +${goalPlan.targetReturnPct.toFixed(2)}% per ${goalPlan.targetPeriod}` : "Create and accept a goal plan first",
+      `Max sim size: ${fmtUsd(maxTradeUsd)}`,
+      `Planned stop: ~${stopPct.toFixed(2)}%`,
+      `Target: ~${targetPct.toFixed(2)}%`,
+      `Required win rate: ${requiredWinRate.toFixed(0)}%+ after estimated costs`,
+    ];
+    return {
+      confidence,
+      rawConfidence,
+      marketRegime,
+      feeDragPct,
+      scannerEdgePct,
+      estimatedMovePct,
+      stopPct,
+      targetPct,
+      requiredWinRate,
+      riskState,
+      riskPctOfEquity,
+      riskBudgetUsd,
+      maxTradeUsd,
+      blockers,
+      shouldTrade,
+      executionRules,
+    };
+  }, [
+    goalPlan,
+    planProgress.status,
+    simCanBuySelected,
+    simEquity,
+    simSelectedHolding,
+    simSelectedHoldingPnl,
+    simSelectedSetup,
+    simState.cashUsd,
+    simState.positions.length,
+    simState.startingCashUsd,
+    simSymbol,
+    signalCalibration.adjustment,
+    watchlistHealth.avgScore,
+    watchlistHealth.scanned,
+    watchlistHealth.tradable,
+  ]);
+  const aiTradeBrief = useMemo(() => {
+    const entryOk = simSelectedSetup?.entryQuality === "VALID";
+    const structureOk = simSelectedSetup?.structureLabel === "OK";
+    const hasPrice = simCanBuySelected;
+    const hasHolding = !!simSelectedHolding;
+    const confidence = advancedAi.confidence;
+
+    const reasons: string[] = [];
+    if (!hasPrice) reasons.push("Waiting for live market price before simulation can buy.");
+    if (entryOk) reasons.push("Entry quality is valid; no fast dump/chase flag active.");
+    else reasons.push(`Entry quality is ${simSelectedSetup?.entryQuality ?? "loading"}; be careful with timing.`);
+    if (structureOk) reasons.push("Structure check is OK with a cleaner 2R map.");
+    else reasons.push(`Structure is ${simSelectedSetup?.structureLabel ?? "loading"}; treat as practice-only.`);
+    reasons.push(`Market regime is ${advancedAi.marketRegime}; estimated edge is ${advancedAi.scannerEdgePct.toFixed(2)}% after estimated fees/slippage.`);
+    if (hasHolding) reasons.push(`You already hold ${simSymbol}; review P/L before adding more.`);
+    if (advancedAi.blockers.length) reasons.push(`Blockers: ${advancedAi.blockers.join(" ")}`);
+
+    let action = "WAIT";
+    let tone = "#111827";
+    let headline = "Let the scanner finish loading";
+    if (advancedAi.shouldTrade) {
+      action = hasHolding ? "MANAGE" : "BUY TEST";
+      tone = "#047857";
+      headline = hasHolding ? "Manage the open position" : "Positive edge sim trade candidate";
+    } else if (hasPrice && confidence >= 62 && advancedAi.riskState !== "RED") {
+      action = "WATCH";
+      headline = "Interesting, but blockers remain";
+    } else if (hasPrice) {
+      action = "SKIP";
+      tone = "#b91c1c";
+      headline = advancedAi.riskState === "RED" ? "Risk guard says stop trading" : "Weak edge for this coin right now";
+    }
+
+    const suggestedUsd = advancedAi.shouldTrade ? Math.max(25, Math.min(simState.cashUsd, advancedAi.maxTradeUsd)) : 0;
+    return { action, confidence, headline, reasons, suggestedUsd, tone };
+  }, [advancedAi, simCanBuySelected, simSelectedHolding, simSelectedSetup, simState.cashUsd, simSymbol]);
+
+  const aiAdvice = useMemo(() => {
+    const candidate =
+      scannerBest[0] ??
+      setups.find((s) => s.entryQuality === "VALID" && s.structureLabel !== "NO_EDGE" && s.combinedScore >= 65) ??
+      setups[0];
+    const symbol = candidate?.symbol ?? simSymbol;
+    const price = (candidate ? getSimPrice(candidate.symbol) || candidate.priceUsd : 0) || 0;
+    const strict = !!candidate && scannerBest.some((s) => s.symbol === candidate.symbol);
+    const validTiming = candidate?.entryQuality === "VALID";
+    const validStructure = candidate?.structureLabel === "OK";
+    const sessionOk = sessionInfo.status !== "WAIT" || overrideGuard;
+    const confidence = clamp(
+      Math.round((candidate?.combinedScore ?? 0) * 0.5 + (validTiming ? 18 : -12) + (validStructure ? 18 : -16) + (sessionOk ? 8 : -10)),
+      0,
+      100
+    );
+    const stopPctForAdvice = clamp(Math.max(0.55, Math.abs(candidate?.change24h ?? 0) * 0.12), 0.55, 2.2);
+    const targetPctForAdvice = stopPctForAdvice * 2.1;
+    const entryLow = price ? price * (1 - stopPctForAdvice * 0.25 / 100) : 0;
+    const entryHigh = price ? price * (1 + stopPctForAdvice * 0.15 / 100) : 0;
+    const stop = candidate?.support ?? (price ? price * (1 - stopPctForAdvice / 100) : 0);
+    const target = candidate?.resistance ?? (price ? price * (1 + targetPctForAdvice / 100) : 0);
+    const holdWindow =
+      strict && confidence >= 78
+        ? (candidate?.change24h ?? 0) >= 5
+          ? "30 minutes to 3 hours, then reassess momentum."
+          : "2 to 8 hours, unless target/stop hits first."
+        : "Do not hold. Wait for a cleaner scanner pass.";
+    const action =
+      strict && sessionOk && confidence >= 78
+        ? "BUY TEST"
+        : validTiming && confidence >= 62
+          ? "WAIT FOR CONFIRMATION"
+          : "DO NOT BUY";
+    const when =
+      action === "BUY TEST"
+        ? "Buy in the simulator only if price stays inside the entry zone and the scanner still says VALID + Structure OK."
+        : action === "WAIT FOR CONFIRMATION"
+          ? "Wait for Structure OK, confidence above 78%, and no fresh dump/chase warning."
+          : "Skip it until the scanner produces a strict candidate.";
+    const invalidation = [
+      `Price loses stop area near ${fmtUsd(stop)}.`,
+      "Entry quality flips away from VALID.",
+      "Structure loses 2R room or turns NO EDGE.",
+      "You already have 3 open holdings or hit your daily loss limit.",
+    ];
+    return {
+      symbol,
+      price,
+      setup: candidate,
+      action,
+      when,
+      holdWindow,
+      entryLow,
+      entryHigh,
+      stop,
+      target,
+      confidence,
+      invalidation,
+      loadable: !!candidate,
+    };
+  }, [getSimPrice, overrideGuard, scannerBest, sessionInfo.status, setups, simSymbol]);
+
+  const holdingReviews = useMemo(() => {
+    const drawdownPct = ((simEquity - simState.startingCashUsd) / simState.startingCashUsd) * 100;
+    const bestAlternative = scannerBest.find((s) => !simState.positions.some((p) => p.symbol === s.symbol));
+    return simState.positions.map((p) => {
+      const now = getSimPrice(p.symbol) || p.entry;
+      const value = now * p.qty;
+      const pnlUsd = (now - p.entry) * p.qty;
+      const pnlPct = (pnlUsd / p.notionalUsd) * 100;
+      const ageHours = Math.max(0, (Date.now() - new Date(p.openedAtIso).getTime()) / (60 * 60 * 1000));
+      const setup = setups.find((s) => s.symbol === p.symbol);
+      const strict = !!setup && setup.entryQuality === "VALID" && setup.structureLabel === "OK" && setup.combinedScore >= 70;
+      const weakSetup = !setup || setup.entryQuality === "NO_EDGE" || setup.structureLabel === "NO_EDGE";
+      const hitStop = typeof p.stop === "number" && now <= p.stop;
+      const hitTarget = typeof p.takeProfit === "number" && now >= p.takeProfit;
+      const canAdd =
+        strict &&
+        pnlPct > 0.35 &&
+        pnlPct < 3.5 &&
+        simState.cashUsd >= 50 &&
+        simState.positions.length < 3 &&
+        drawdownPct > -1.5;
+      let action: "SELL" | "HOLD" | "INCREASE" = "HOLD";
+      let tone = "#111827";
+      const reasons: string[] = [];
+
+      if (hitStop) {
+        action = "SELL";
+        tone = "#b91c1c";
+        reasons.push("Price has reached or lost the planned stop.");
+      } else if (weakSetup && pnlPct < 0.25) {
+        action = "SELL";
+        tone = "#b91c1c";
+        reasons.push("Scanner/structure no longer supports the position.");
+      } else if (pnlPct <= -2) {
+        action = "SELL";
+        tone = "#b91c1c";
+        reasons.push("Loss is getting too large for a day-trade simulation.");
+      } else if (hitTarget || pnlPct >= 4) {
+        action = "SELL";
+        tone = "#047857";
+        reasons.push("Target or strong profit zone reached; bank the sim win.");
+      } else if (canAdd) {
+        action = "INCREASE";
+        tone = "#047857";
+        reasons.push("Position is working and scanner still supports the setup.");
+      } else {
+        reasons.push(strict ? "Hold while scanner remains VALID + Structure OK." : "Hold only if your original thesis is still intact.");
+      }
+
+      if (ageHours >= 8 && pnlPct < 1) reasons.push("Long hold with weak progress; consider freeing capital.");
+      if (simState.positions.length >= 3) reasons.push("Portfolio already has max open holdings; no adding.");
+      if (drawdownPct <= -1.5) reasons.push("Account drawdown guard is active; no adding.");
+      if (bestAlternative && (!setup || bestAlternative.combinedScore - setup.combinedScore >= 12) && pnlPct < 1.25) {
+        if (action !== "SELL") {
+          action = "SELL";
+          tone = "#b91c1c";
+        }
+        reasons.push(`${bestAlternative.symbol} is a stronger current scanner setup; free capital if your thesis is stale.`);
+      }
+
+      const addUsd = Math.max(0, Math.min(simState.cashUsd, Math.round(value * 0.35), 250));
+      return {
+        id: p.id,
+        symbol: p.symbol,
+        action,
+        tone,
+        now,
+        value,
+        pnlUsd,
+        pnlPct,
+        ageHours,
+        setup,
+        canAdd,
+        addUsd,
+        bestAlternative: bestAlternative?.symbol,
+        reasons,
+      };
+    });
+  }, [getSimPrice, scannerBest, setups, simEquity, simState.cashUsd, simState.positions, simState.startingCashUsd]);
+
+  const holdingSummary = useMemo(() => {
+    const sell = holdingReviews.filter((r) => r.action === "SELL").length;
+    const hold = holdingReviews.filter((r) => r.action === "HOLD").length;
+    const increase = holdingReviews.filter((r) => r.action === "INCREASE").length;
+    const headline = sell ? "Reduce risk" : increase ? "One add candidate" : hold ? "Hold and monitor" : "No holdings";
+    return { sell, hold, increase, headline };
+  }, [holdingReviews]);
+
+  const regimeDiagnostics = useMemo(() => {
+    const priced = setups.filter((s) => typeof s.change24h === "number");
+    const breadth = priced.length ? (priced.filter((s) => (s.change24h ?? 0) > 0).length / priced.length) * 100 : 0;
+    const avgChange = priced.length ? priced.reduce((acc, s) => acc + (s.change24h ?? 0), 0) / priced.length : 0;
+    const avgVolFactor = priced.length ? priced.reduce((acc, s) => acc + s.volFactor, 0) / priced.length : 0;
+    const strictRate = watchlistHealth.scanned ? (watchlistHealth.tradable / watchlistHealth.scanned) * 100 : 0;
+    const label =
+      breadth >= 58 && avgChange > 1.2 && strictRate >= 3
+        ? "Risk-on rotation"
+        : breadth <= 42 || avgChange < -1
+          ? "Defensive / sell pressure"
+          : avgVolFactor > 1.2
+            ? "Volatile selective tape"
+            : "Choppy / wait-heavy";
+    const action =
+      label === "Risk-on rotation"
+        ? "Let only top strict setups compete for capital."
+        : label === "Defensive / sell pressure"
+          ? "Cut weak holdings quickly and reduce new buys."
+          : label === "Volatile selective tape"
+            ? "Use smaller size and faster review windows."
+            : "Avoid forcing trades; demand VALID + Structure OK.";
+    return { label, breadth, avgChange, avgVolFactor, strictRate, action };
+  }, [setups, watchlistHealth.scanned, watchlistHealth.tradable]);
+
+  const tradeGrades = useMemo(() => {
+    return simState.history.slice(0, 12).map((t) => {
+      const setup = setups.find((s) => s.symbol === t.symbol);
+      const followedScanner = t.source.includes("AI") || t.source.includes("Scanner") || t.thesis?.toLowerCase().includes("ai");
+      const cleanStructure = setup?.entryQuality === "VALID" && setup?.structureLabel === "OK";
+      const score = clamp(Math.round(52 + t.pnlPct * 7 + (followedScanner ? 14 : -5) + (cleanStructure ? 12 : -8)), 0, 100);
+      const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 55 ? "C" : "D";
+      const lesson =
+        grade === "A"
+          ? "Repeat this pattern, but do not increase size until it repeats."
+          : grade === "B"
+            ? "Good enough; tighten entry or exit discipline."
+            : grade === "C"
+              ? "Mixed trade. Review timing and stop discipline."
+              : "Do not scale this setup type until evidence improves.";
+      return { id: t.id, symbol: t.symbol, pnlPct: t.pnlPct, pnlUsd: t.pnlUsd, grade, score, lesson };
+    });
+  }, [setups, simState.history]);
+
+  const accuracyScore = useMemo(() => {
+    const simScore = simState.history.length ? clamp(50 + simStats.expectancyPct * 9 + (simStats.winRate - 50) * 0.45, 0, 100) : 45;
+    const replayScore = scannerReplay.trades.length ? clamp(50 + scannerReplay.expectancyPct * 11 + (scannerReplay.winRate - 50) * 0.35, 0, 100) : 42;
+    const calibrationScore = signalCalibration.resolved.length ? clamp(100 - Math.abs(signalCalibration.confidenceGap) * 1.5, 0, 100) : 55;
+    const evidenceWeight = clamp((simState.history.length + scannerReplay.trades.length + signalCalibration.resolved.length) / 30, 0.2, 1);
+    const score = Math.round((simScore * 0.35 + replayScore * 0.4 + calibrationScore * 0.25) * evidenceWeight);
+    return { score, simScore, replayScore, calibrationScore, evidenceWeight };
+  }, [scannerReplay.expectancyPct, scannerReplay.trades.length, scannerReplay.winRate, signalCalibration.confidenceGap, signalCalibration.resolved.length, simState.history.length, simStats.expectancyPct, simStats.winRate]);
+
+  const requestAiAdvisor = async () => {
+    setAiAdvisorLoading(true);
+    setAiAdvisorError(null);
+    try {
+      const slimSetup = (s: SetupRow) => ({
+        symbol: s.symbol,
+        score: Math.round(s.combinedScore),
+        priceUsd: s.priceUsd,
+        change24h: s.change24h,
+        volumeFactor: Number(s.volFactor.toFixed(2)),
+        entryQuality: s.entryQuality,
+        structureLabel: s.structureLabel,
+        support: s.support,
+        resistance: s.resistance,
+        roomTo2R: s.roomTo2R,
+        why: s.why.slice(0, 3),
+        blockers: [...s.whyNot, ...s.structureWhy].slice(0, 4),
+      });
+      const holdings = simState.positions.map((p) => {
+        const now = getSimPrice(p.symbol) || p.entry;
+        const pnlUsd = (now - p.entry) * p.qty;
+        return {
+          symbol: p.symbol,
+          entry: p.entry,
+          now,
+          valueUsd: now * p.qty,
+          pnlUsd,
+          pnlPct: (pnlUsd / p.notionalUsd) * 100,
+          thesis: p.thesis,
+        };
+      });
+
+      const res = await fetch("/.netlify/functions/aiAdvisor", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          goalPlan,
+          selectedSymbol: simSymbol,
+          market: setups.slice(0, 15).map(slimSetup),
+          scannerBest: scannerBest.map(slimSetup),
+          holdings,
+          simHistory: simState.history.slice(0, 20),
+          simStats: { simStats, planProgress, regimeDiagnostics, accuracyScore, scannerReplay },
+          liveNewsMode,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.setup || data?.error || "AI advisor request failed.");
+      setAiAdvisor(data as AiAdvisorResponse);
+      const ideas = ((data as AiAdvisorResponse).tradeIdeas ?? []).filter((idea) => idea.action === "BUY_TEST" || idea.action === "WATCH");
+      if (ideas.length) {
+        setAiSignals((prev) => [
+          ...ideas.slice(0, 5).map((idea) => {
+            const setup = setups.find((s) => s.symbol === idea.symbol.toUpperCase());
+            return {
+              id: uuid(),
+              tsIso: new Date().toISOString(),
+              symbol: idea.symbol.toUpperCase(),
+              action: idea.action,
+              confidence: idea.confidence,
+              entry: getSimPrice(idea.symbol.toUpperCase()) || setup?.priceUsd || 0,
+              score: setup?.combinedScore ?? 0,
+              verdict: "OPEN" as const,
+            };
+          }),
+          ...prev,
+        ].slice(0, 500));
+      }
+    } catch (e: unknown) {
+      setAiAdvisorError(getErrorMessage(e, "AI advisor failed."));
+    } finally {
+      setAiAdvisorLoading(false);
+    }
+  };
+
+  const loadAiIdeaIntoTicket = (idea: AiTradeIdea) => {
+    const symbol = idea.symbol.toUpperCase();
+    const setup = setups.find((s) => s.symbol === symbol);
+    const price = getSimPrice(symbol) || setup?.priceUsd || 0;
+    setSimSymbol(symbol);
+    setFocusSymbol(symbol);
+    if (price) {
+      setEntryPrice(price);
+      setStopPrice(setup?.support ?? price * 0.985);
+    }
+    if (idea.allocationUsd > 0) setSimBuyUsd(String(Math.min(simState.cashUsd, Math.round(idea.allocationUsd))));
+    setSimThesis(`Real AI ${idea.action}: ${idea.thesis} Plan fit: ${idea.planFit}`);
+  };
+
+  const buySimCrypto = (symbol = simSymbol, buyUsd = Number(simBuyUsd)) => {
+    const price = getSimPrice(symbol) || (symbol === simSymbol ? simulatorPrice : 0);
+    const notional = Number.isFinite(buyUsd) ? buyUsd : 0;
+    if (!price || !isFinite(price)) {
+      alert("No price available yet. Refresh market data first.");
+      return;
+    }
+    if (notional <= 0) {
+      alert("Enter a buy amount first.");
+      return;
+    }
+    if (notional > simState.cashUsd) {
+      alert("Buy amount is larger than your simulator cash.");
+      return;
+    }
+
+    const setup = setups.find((s) => s.symbol === symbol);
+    const position: SimPosition = {
+      id: uuid(),
+      openedAtIso: new Date().toISOString(),
+      symbol,
+      side: "LONG",
+      entry: price,
+      qty: notional / price,
+      notionalUsd: notional,
+      stop: symbol === focusSymbol && stopDistanceLong > 0 ? stopPrice : undefined,
+      takeProfit: symbol === focusSymbol && tp2Long > 0 ? tp2Long : undefined,
+      thesis: simThesis.trim() || undefined,
+      source: setup ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}` : edgeGrade.label,
+    };
+    setSimState((s) => ({ ...s, cashUsd: s.cashUsd - notional, positions: [position, ...s.positions] }));
+    setSimSymbol(symbol);
+    setFocusSymbol(symbol);
+    if (price) {
+      setEntryPrice(price);
+      setStopPrice(price * 0.985);
+    }
+    setSimThesis("");
+  };
+
+  const sellSimHolding = (id: string) => {
+    setSimState((s) => {
+      const position = s.positions.find((p) => p.id === id);
+      if (!position) return s;
+      const exit = getSimPrice(position.symbol) || position.entry;
+      const pnlUsd = (exit - position.entry) * position.qty;
+      const closed: SimClosedTrade = {
+        ...position,
+        closedAtIso: new Date().toISOString(),
+        exit,
+        pnlUsd,
+        pnlPct: (pnlUsd / position.notionalUsd) * 100,
+      };
+      return {
+        ...s,
+        cashUsd: s.cashUsd + position.notionalUsd + pnlUsd,
+        positions: s.positions.filter((p) => p.id !== id),
+        history: [closed, ...s.history].slice(0, 250),
+      };
+    });
+  };
+
+  const resetSimulator = () => {
+    if (!confirm("Reset simulator cash, holdings, and buy/sell history?")) return;
+    setSimState(defaultSimState());
+  };
+
   // Per-coin action gating: strict safety first
   const coinActionAllowed = (s: SetupRow) => {
     if (!tradingAllowed) return false;
@@ -954,12 +1931,13 @@ export default function App() {
 
   // Trust messaging
   const processMessage = useMemo(() => {
-    if (commitRequired) return { tone: "#ffb6b6", text: "Commit today’s rules before you trade." };
-    if (dayState.locked) return { tone: "#ffb6b6", text: dayState.lockedReason ?? "Session locked — stop trading." };
-    if (sessionInfo.status === "WAIT" && !overrideGuard) return { tone: "#ffb6b6", text: "WAIT window — protect capital. Don’t force entries." };
-    if (!sessionAllowedByCommit && !overrideGuard) return { tone: "#ffb6b6", text: "This session isn’t in your plan. Wait for your allowed window." };
-    if (sessionInfo.status === "SELECTIVE") return { tone: "#f2e7cd", text: "Selective window — A+ only. One clean setup beats five weak ones." };
-    return { tone: "#82f0b9", text: "Trade window — execute your rules, not your emotions." };
+    if (commitRequired) return { tone: "#b91c1c", text: "Commit today’s rules before you trade." };
+    if (dayState.locked && overrideGuard) return { tone: "#92400e", text: "Lock override active — simulator/testing only. Keep size tiny." };
+    if (dayState.locked) return { tone: "#b91c1c", text: dayState.lockedReason ?? "Session locked — stop trading." };
+    if (sessionInfo.status === "WAIT" && !overrideGuard) return { tone: "#b91c1c", text: "WAIT window — protect capital. Don’t force entries." };
+    if (!sessionAllowedByCommit && !overrideGuard) return { tone: "#b91c1c", text: "This session isn’t in your plan. Wait for your allowed window." };
+    if (sessionInfo.status === "SELECTIVE") return { tone: "#111827", text: "Selective window — A+ only. One clean setup beats five weak ones." };
+    return { tone: "#047857", text: "Trade window — execute your rules, not your emotions." };
   }, [commitRequired, dayState.locked, dayState.lockedReason, sessionInfo.status, overrideGuard, sessionAllowedByCommit]);
 
   // Log helpers
@@ -999,6 +1977,11 @@ export default function App() {
     setDayState((s) => ({ ...s, locked: true, lockedReason: "Manual END SESSION — you chose capital protection." }));
   };
 
+  const unlockSessionNow = () => {
+    if (!confirm("Override today's lock? Your trade log stays intact, but the guard will allow more testing.")) return;
+    setDayState((s) => ({ ...s, locked: false, lockedReason: undefined }));
+  };
+
   // Commitment UI state
   const [commitDraft, setCommitDraft] = useState<CommitConfig>(() => defaultCommit(todayKey));
   useEffect(() => setCommitDraft(defaultCommit(todayKey)), [todayKey]);
@@ -1025,55 +2008,154 @@ export default function App() {
     saveDayState(fresh);
   };
 
+  const activateDemoPass = () => {
+    localStorage.setItem(LS_PRO_PASS, "active");
+    setProPass(true);
+  };
+
+  const saveLead = () => {
+    const email = leadEmail.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      alert("Enter a valid email first.");
+      return;
+    }
+
+    const lead = {
+      email,
+      tsIso: new Date().toISOString(),
+      edgeGrade: edgeGrade.label,
+      strictSignals: scannerBest.length,
+      source: "app-pro-card",
+    };
+    const current = JSON.parse(localStorage.getItem(LS_LEADS) || "[]") as Array<typeof lead>;
+    localStorage.setItem(LS_LEADS, JSON.stringify([lead, ...current].slice(0, 250)));
+    setLeadEmail("");
+    setLeadSaved(true);
+    setTimeout(() => setLeadSaved(false), 3000);
+  };
+
+  const openCheckout = () => {
+    window.open(CHECKOUT_URL, "_blank", "noopener,noreferrer");
+  };
+
+  const exportJournalCsv = () => {
+    const header = "time,symbol,side,entry,stop,exit,r,rules_followed,note";
+    const lines = dayState.trades.map((t) =>
+      [
+        t.tsIso,
+        t.symbol,
+        t.side,
+        t.entry,
+        t.stop,
+        t.exit,
+        t.r.toFixed(4),
+        t.rulesFollowed ? "yes" : "no",
+        `"${(t.note ?? "").replaceAll('"', '""')}"`,
+      ].join(",")
+    );
+    const blob = new Blob([[header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `obsidian-journal-${todayKey}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // ===== Styles =====
   const appWrap: React.CSSProperties = {
     minHeight: "100vh",
     background:
-      "radial-gradient(1000px 600px at 20% 10%, rgba(212,199,161,0.12), transparent 60%), linear-gradient(180deg, #0b0b0c 0%, #070707 100%)",
-    color: "#eaeaea",
-    fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial",
+      "linear-gradient(180deg, #f6f8fb 0%, #eef3f7 48%, #e7edf3 100%)",
+    color: "#172033",
+    fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial",
   };
 
   const topbar: React.CSSProperties = {
     position: "sticky",
     top: 0,
     zIndex: 10,
-    padding: "14px 18px",
-    borderBottom: "1px solid rgba(255,255,255,0.06)",
-    background: "rgba(8,8,8,0.75)",
-    backdropFilter: "blur(10px)",
+    padding: "10px 18px",
+    borderBottom: "1px solid #d8e0ea",
+    background: "rgba(255,255,255,0.92)",
+    backdropFilter: "blur(18px)",
+    boxShadow: "0 10px 28px rgba(15,23,42,0.08)",
   };
 
-  const row: React.CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 };
-  const brand: React.CSSProperties = { display: "flex", alignItems: "center", gap: 10, fontWeight: 900, letterSpacing: 1.2 };
+  const row: React.CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" };
+  const brand: React.CSSProperties = { display: "flex", alignItems: "center", gap: 10, fontWeight: 950, letterSpacing: 0.4, minWidth: 250, color: "#0f172a" };
   const dot: React.CSSProperties = {
-    width: 14,
-    height: 14,
-    borderRadius: 4,
-    background: "linear-gradient(135deg, rgba(212,199,161,0.9), rgba(212,199,161,0.2))",
-    boxShadow: "0 0 16px rgba(212,199,161,0.25)",
+    width: 18,
+    height: 18,
+    borderRadius: 5,
+    background: "#0f766e",
+    boxShadow: "inset 0 0 0 4px rgba(255,255,255,0.38)",
   };
 
-  const tabsWrap: React.CSSProperties = { display: "flex", alignItems: "center", gap: 10 };
+  const tabsWrap: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" };
   const tabBtn = (active: boolean): React.CSSProperties => ({
-    padding: "8px 12px",
-    borderRadius: 999,
-    border: active ? "1px solid rgba(212,199,161,0.7)" : "1px solid rgba(255,255,255,0.08)",
-    background: active ? "rgba(212,199,161,0.08)" : "rgba(255,255,255,0.03)",
-    color: active ? "#f2e7cd" : "#bdbdbd",
+    padding: "9px 12px",
+    borderRadius: 7,
+    border: active ? "1px solid #0f766e" : "1px solid #d8e0ea",
+    background: active ? "#0f766e" : "#ffffff",
+    color: active ? "#ffffff" : "#475569",
     fontWeight: 800,
     cursor: "pointer",
     userSelect: "none",
+    boxShadow: active ? "0 8px 18px rgba(15,118,110,0.18)" : "none",
   });
 
   const shell: React.CSSProperties = { padding: "14px 18px 24px", maxWidth: 1500, margin: "0 auto" };
 
+  const commandHero: React.CSSProperties = {
+    borderRadius: 8,
+    border: "1px solid #d8e0ea",
+    background:
+      "linear-gradient(135deg, #ffffff 0%, #f8fafc 58%, #eef7f5 100%)",
+    boxShadow: "0 18px 40px rgba(15,23,42,0.08)",
+    padding: 18,
+    overflow: "hidden",
+    position: "relative",
+  };
+
+  const heroGrid: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1.2fr 0.8fr",
+    gap: 18,
+    alignItems: "stretch",
+  };
+
+  const heroKicker: React.CSSProperties = {
+    color: "#0f766e",
+    fontSize: "0.76rem",
+    fontWeight: 950,
+    letterSpacing: 1.4,
+  };
+
+  const heroTitle: React.CSSProperties = {
+    margin: "7px 0 0",
+    color: "#0f172a",
+    fontSize: "clamp(2rem, 3.6vw, 4.1rem)",
+    lineHeight: 0.98,
+    fontWeight: 950,
+    letterSpacing: 0,
+  };
+
+  const heroMetric: React.CSSProperties = {
+    borderRadius: 8,
+    border: "1px solid #d8e0ea",
+    background: "#ffffff",
+    padding: 12,
+    minHeight: 88,
+    boxShadow: "0 8px 22px rgba(15,23,42,0.05)",
+  };
+
   const pill: React.CSSProperties = {
     padding: "6px 10px",
-    borderRadius: 999,
-    border: "1px solid rgba(255,255,255,0.08)",
-    background: "rgba(255,255,255,0.03)",
-    color: "#bdbdbd",
+    borderRadius: 7,
+    border: "1px solid #d8e0ea",
+    background: "#f8fafc",
+    color: "#475569",
     fontSize: "0.78rem",
     fontWeight: 800,
     whiteSpace: "nowrap",
@@ -1081,15 +2163,15 @@ export default function App() {
 
   const banner: React.CSSProperties = {
     marginTop: 10,
-    border: "1px solid rgba(255,255,255,0.06)",
-    background: "linear-gradient(90deg, rgba(212,199,161,0.08), rgba(255,255,255,0.02))",
-    borderRadius: 16,
+    border: "1px solid #d8e0ea",
+    background: "#f8fafc",
+    borderRadius: 8,
     padding: "10px 12px",
     display: "flex",
     justifyContent: "space-between",
     gap: 12,
     alignItems: "center",
-    color: "#bdbdbd",
+    color: "#475569",
     fontSize: "0.85rem",
     flexWrap: "wrap",
   };
@@ -1109,64 +2191,86 @@ export default function App() {
   };
 
   const panel: React.CSSProperties = {
-    borderRadius: 16,
-    border: "1px solid rgba(255,255,255,0.07)",
-    background: "radial-gradient(900px 360px at 20% 0%, rgba(212,199,161,0.10), transparent 60%), rgba(255,255,255,0.02)",
-    boxShadow: "0 16px 40px rgba(0,0,0,0.45)",
-    padding: 14,
+    borderRadius: 8,
+    border: "1px solid #d8e0ea",
+    background: "#ffffff",
+    boxShadow: "0 16px 34px rgba(15,23,42,0.07)",
+    padding: 16,
     overflow: "hidden",
   };
 
   const btn: React.CSSProperties = {
     padding: "8px 12px",
-    borderRadius: 999,
-    border: "1px solid rgba(212,199,161,0.45)",
-    background: "rgba(212,199,161,0.10)",
-    color: "#f2e7cd",
+    borderRadius: 7,
+    border: "1px solid #0f766e",
+    background: "#0f766e",
+    color: "#ffffff",
     fontWeight: 900,
     cursor: "pointer",
   };
 
   const btnDanger: React.CSSProperties = {
     ...btn,
-    border: "1px solid rgba(255,120,120,0.55)",
-    background: "rgba(255,120,120,0.12)",
-    color: "#ffd1d1",
+    border: "1px solid #b91c1c",
+    background: "#b91c1c",
+    color: "#ffffff",
   };
 
   const btnDisabled: React.CSSProperties = {
     ...btn,
     opacity: 0.45,
     cursor: "not-allowed",
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#bdbdbd",
+    border: "1px solid #cbd5e1",
+    background: "#e2e8f0",
+    color: "#64748b",
   };
 
   const input: React.CSSProperties = {
     width: "100%",
     padding: "10px 10px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.08)",
-    background: "rgba(0,0,0,0.25)",
-    color: "#eaeaea",
+    borderRadius: 7,
+    border: "1px solid #cbd5e1",
+    background: "#ffffff",
+    color: "#0f172a",
     outline: "none",
   };
 
-  const subtle: React.CSSProperties = { color: "#9a9a9a", fontSize: "0.82rem", lineHeight: 1.45 };
+  const subtle: React.CSSProperties = { color: "#64748b", fontSize: "0.82rem", lineHeight: 1.45 };
+  const statCard: React.CSSProperties = {
+    borderRadius: 8,
+    border: "1px solid #e2e8f0",
+    background: "#f8fafc",
+    padding: 12,
+  };
+  const proPanel: React.CSSProperties = {
+    borderRadius: 8,
+    border: "1px solid #b7d8d3",
+    background: "#eef7f5",
+    padding: 14,
+  };
+  const sectionTitle: React.CSSProperties = { color: "#0f766e", fontWeight: 950, letterSpacing: 0.6, fontSize: "0.78rem" };
+  const emptyState: React.CSSProperties = {
+    borderRadius: 8,
+    border: "1px dashed #cbd5e1",
+    background: "#f8fafc",
+    padding: 14,
+    color: "#64748b",
+    fontSize: "0.84rem",
+    lineHeight: 1.5,
+  };
 
   function ScorePill({ score }: { score: number }) {
     let bg = "rgba(255, 90, 90, 0.20)";
     let border = "rgba(255, 90, 90, 0.35)";
-    let text = "#ffb6b6";
+    let text = "#b91c1c";
     if (score >= 80) {
       bg = "rgba(212, 199, 161, 0.22)";
       border = "rgba(212, 199, 161, 0.8)";
-      text = "#f2e7cd";
+      text = "#111827";
     } else if (score >= 65) {
       bg = "rgba(70, 220, 140, 0.16)";
       border = "rgba(70, 220, 140, 0.32)";
-      text = "#bff6d8";
+      text = "#047857";
     }
     return (
       <span
@@ -1189,16 +2293,30 @@ export default function App() {
     );
   }
 
+  function ProBadge() {
+    return (
+      <span
+        style={{
+          ...pill,
+          borderColor: proPass ? "rgba(130,240,185,0.45)" : "rgba(212,199,161,0.45)",
+          color: proPass ? "#047857" : "#111827",
+        }}
+      >
+        {proPass ? "PRO ACTIVE" : `PRO ${PRO_PRICE}`}
+      </span>
+    );
+  }
+
   function EntryQualityBadge({ s }: { s: SetupRow }) {
     if (s.entryQuality === "VALID") return null;
     const isNoEdge = s.entryQuality === "NO_EDGE";
     return (
       <div style={{ marginTop: 8 }}>
-        <div style={{ fontWeight: 950, color: isNoEdge ? "#ffb6b6" : "#f2e7cd" }}>
+        <div style={{ fontWeight: 950, color: isNoEdge ? "#b91c1c" : "#111827" }}>
           {isNoEdge ? "🚫 NO EDGE — WAIT" : "⚠️ EXTENDED — DON’T CHASE"}
         </div>
         {!!s.whyNot?.length && (
-          <div style={{ marginTop: 6, color: "#9a9a9a", fontSize: "0.82rem", lineHeight: 1.4 }}>
+          <div style={{ marginTop: 6, color: "#64748b", fontSize: "0.82rem", lineHeight: 1.4 }}>
             {s.whyNot.slice(0, 2).join(" · ")}
           </div>
         )}
@@ -1211,13 +2329,13 @@ export default function App() {
 
     const isNoEdge = s.structureLabel === "NO_EDGE";
     const title = isNoEdge ? "🚫 STRUCTURE NO EDGE — NO 2R ROOM" : "⏳ STRUCTURE WAIT — NO CLEAN MAP";
-    const tone = isNoEdge ? "#ffb6b6" : "#f2e7cd";
+    const tone = isNoEdge ? "#b91c1c" : "#111827";
 
     return (
       <div style={{ marginTop: 8 }}>
         <div style={{ fontWeight: 950, color: tone }}>{title}</div>
         {!!s.structureWhy?.length && (
-          <div style={{ marginTop: 6, color: "#9a9a9a", fontSize: "0.82rem", lineHeight: 1.4 }}>
+          <div style={{ marginTop: 6, color: "#64748b", fontSize: "0.82rem", lineHeight: 1.4 }}>
             {s.structureWhy.slice(0, 2).join(" · ")}
           </div>
         )}
@@ -1277,9 +2395,9 @@ export default function App() {
               left: 6,
               fontSize: "0.7rem",
               fontWeight: 950,
-              color: s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE" ? "#ffd1d1" : "#f2e7cd",
-              background: "rgba(0,0,0,0.45)",
-              border: "1px solid rgba(255,255,255,0.10)",
+              color: s.entryQuality === "NO_EDGE" || s.structureLabel === "NO_EDGE" ? "#991b1b" : "#111827",
+              background: "#f1f5f9",
+              border: "1px solid #d8e0ea",
               borderRadius: 999,
               padding: "2px 8px",
             }}
@@ -1300,7 +2418,7 @@ export default function App() {
   const bannerLeft = (
     <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
       <span style={{ ...pill, borderColor: "rgba(212,199,161,0.35)" }}>{sessionInfo.session}</span>
-      <span style={{ ...pill, borderColor: "rgba(255,255,255,0.10)", color: sessionInfo.color }}>
+      <span style={{ ...pill, borderColor: "#d8e0ea", color: sessionInfo.color }}>
         {sessionInfo.status === "TRADE" ? "TRADE WINDOW" : sessionInfo.status === "SELECTIVE" ? "BE SELECTIVE" : "WAIT"}
       </span>
       <span style={{ color: processMessage.tone, fontWeight: 900 }}>{processMessage.text}</span>
@@ -1310,29 +2428,36 @@ export default function App() {
   const bannerRight = (
     <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
       <span style={pill}>
-        Next change: <b style={{ color: "#f2e7cd" }}>{sessionInfo.countdown}</b>
+        Next change: <b style={{ color: "#111827" }}>{sessionInfo.countdown}</b>
       </span>
 
       {(sessionInfo.status === "WAIT" || !sessionAllowedByCommit || dayState.locked) && (
-        <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#ffb6b6", fontWeight: 900 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#b91c1c", fontWeight: 900 }}>
           <input type="checkbox" checked={overrideGuard} onChange={(e) => setOverrideGuard(e.target.checked)} />
           Override guard (not recommended)
         </label>
       )}
 
+      {dayState.locked && (
+        <button style={btnDanger} onClick={unlockSessionNow}>
+          Unlock Session
+        </button>
+      )}
+
       <span style={pill}>
-        Trades: <b style={{ color: "#f2e7cd" }}>{tradesToday}</b> · R:{" "}
-        <b style={{ color: rToday >= 0 ? "#82f0b9" : "#ffb6b6" }}>{fmtR(rToday)}</b>
+        Trades: <b style={{ color: "#111827" }}>{tradesToday}</b> · R:{" "}
+        <b style={{ color: rToday >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(rToday)}</b>
       </span>
 
       {lastUpdated ? (
         <span style={pill}>
           Updated:{" "}
-          <b style={{ color: "#f2e7cd" }}>
+          <b style={{ color: "#111827" }}>
             {new Date(lastUpdated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
           </b>
         </span>
       ) : null}
+      <ProBadge />
     </div>
   );
 
@@ -1340,7 +2465,7 @@ export default function App() {
     <div style={{ ...panel, marginTop: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <div>
-          <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>DAILY PRE-COMMITMENT</div>
+          <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>DAILY PRE-COMMITMENT</div>
           <div style={{ ...subtle, marginTop: 4 }}>
             Commit once, then execute calmly. The guard stops you when your edge is statistically exhausted.
           </div>
@@ -1393,26 +2518,20 @@ export default function App() {
 
         <div style={{ gridColumn: "span 2" }}>
           <div style={subtle}>Allowed sessions (your plan)</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8, color: "#bdbdbd", fontWeight: 800 }}>
-            {[
-              ["allowAsia", "Asia"],
-              ["allowEurope", "Europe"],
-              ["allowOverlap", "Europe+US overlap"],
-              ["allowUS", "US"],
-              ["allowOffPeak", "Off-peak"],
-            ].map(([k, label]) => (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8, color: "#64748b", fontWeight: 800 }}>
+            {COMMIT_SESSION_OPTIONS.map(([k, label]) => (
               <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <input
                   type="checkbox"
-                  checked={(commitDraft as any)[k]}
-                  onChange={(e) => setCommitDraft((c) => ({ ...(c as any), [k]: e.target.checked }))}
+                  checked={commitDraft[k]}
+                  onChange={(e) => setCommitDraft((c) => ({ ...c, [k]: e.target.checked }))}
                 />
                 {label}
               </label>
             ))}
           </div>
           <div style={{ ...subtle, marginTop: 8 }}>
-            Recommended default: <b style={{ color: "#f2e7cd" }}>Europe + Overlap + US</b>.
+            Recommended default: <b style={{ color: "#111827" }}>Europe + Overlap + US</b>.
           </div>
         </div>
       </div>
@@ -1423,12 +2542,12 @@ export default function App() {
     <div style={{ ...panel, marginTop: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <div>
-          <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>TODAY’S COMMITMENT</div>
+          <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>TODAY’S COMMITMENT</div>
           <div style={{ ...subtle, marginTop: 4 }}>
-            Max trades: <b style={{ color: "#f2e7cd" }}>{commit.maxTrades}</b> · Max loss:{" "}
-            <b style={{ color: "#f2e7cd" }}>-{commit.maxDailyLossR}R</b> · Consecutive losses:{" "}
-            <b style={{ color: "#f2e7cd" }}>{commit.maxConsecutiveLosses}</b> · Risk:{" "}
-            <b style={{ color: "#f2e7cd" }}>{commit.riskPct}%</b>
+            Max trades: <b style={{ color: "#111827" }}>{commit.maxTrades}</b> · Max loss:{" "}
+            <b style={{ color: "#111827" }}>-{commit.maxDailyLossR}R</b> · Consecutive losses:{" "}
+            <b style={{ color: "#111827" }}>{commit.maxConsecutiveLosses}</b> · Risk:{" "}
+            <b style={{ color: "#111827" }}>{commit.riskPct}%</b>
           </div>
         </div>
         <button
@@ -1447,12 +2566,43 @@ export default function App() {
   // Pages
   const Dashboard = () => (
     <>
+      <div style={{ ...proPanel, marginTop: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 14, alignItems: "center" }}>
+          <div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ color: edgeGrade.color, fontWeight: 950, letterSpacing: 0.8 }}>EDGE MODE: {edgeGrade.label}</div>
+              <ProBadge />
+            </div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              {edgeGrade.note} Strict candidates: <b style={{ color: "#111827" }}>{watchlistHealth.tradable}</b> · Blocked traps:{" "}
+              <b style={{ color: "#b91c1c" }}>{watchlistHealth.blocked}</b> · Avg activity:{" "}
+              <b style={{ color: "#111827" }}>{Math.round(watchlistHealth.avgScore)}</b>/100
+            </div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              AI brief: <b style={{ color: aiTradeBrief.tone }}>{aiTradeBrief.action}</b> · confidence{" "}
+              <b style={{ color: "#111827" }}>{aiTradeBrief.confidence}%</b> · {proPass ? "full decision chain active" : "Basic shows preview, Pro unlocks full brief"}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button style={btn} onClick={() => setTab("scanner")}>
+              Open Scanner
+            </button>
+            <button style={btn} onClick={() => setTab("simulator")}>
+              Practice
+            </button>
+            <button style={proPass ? btn : btnDanger} onClick={() => (proPass ? setTab("pro") : openCheckout())}>
+              {proPass ? "Manage Pro" : `Unlock Pro ${PRO_PRICE}`}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div style={grid3}>
         {/* COL 1 — Market + Top Momentum */}
         <div style={panel}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
             <div>
-              <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>MARKET OVERVIEW</div>
+              <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>MARKET OVERVIEW</div>
               <div style={{ ...subtle, marginTop: 2 }}>
                 Live snapshot (CoinGecko). Entry Quality + Structure protect you from bad timing.
               </div>
@@ -1471,13 +2621,13 @@ export default function App() {
                   style={{
                     borderRadius: 14,
                     border: "1px solid rgba(255,255,255,0.07)",
-                    background: "rgba(0,0,0,0.22)",
+                    background: "#f8fafc",
                     padding: 12,
                   }}
                 >
-                  <div style={{ fontWeight: 900, color: "#bdbdbd" }}>{sym}</div>
+                  <div style={{ fontWeight: 900, color: "#64748b" }}>{sym}</div>
                   <div style={{ marginTop: 6, fontWeight: 950, fontSize: "1.05rem" }}>{fmtUsd(m?.priceUsd)}</div>
-                  <div style={{ marginTop: 4, color: (m?.change24h ?? 0) >= 0 ? "#82f0b9" : "#ff8a8a", fontWeight: 900 }}>
+                  <div style={{ marginTop: 4, color: (m?.change24h ?? 0) >= 0 ? "#047857" : "#b91c1c", fontWeight: 900 }}>
                     {m?.change24h === undefined ? "—" : `${m.change24h >= 0 ? "+" : ""}${fmtPct(m.change24h)}`}
                   </div>
                 </div>
@@ -1486,7 +2636,7 @@ export default function App() {
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 14 }}>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>TOP ACTIVITY</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>TOP ACTIVITY</div>
             <div style={{ ...subtle }}>Now includes Entry Quality + Structure (2R hard block)</div>
           </div>
 
@@ -1507,7 +2657,7 @@ export default function App() {
                   style={{
                     borderRadius: 14,
                     border: "1px solid rgba(255,255,255,0.07)",
-                    background: "rgba(0,0,0,0.22)",
+                    background: "#f8fafc",
                     padding: 12,
                     cursor: allowed ? "pointer" : "not-allowed",
                     opacity: allowed ? 1 : 0.55,
@@ -1525,10 +2675,10 @@ export default function App() {
                   <EntryQualityBadge s={s} />
                   <StructureBadge s={s} />
 
-                  {s.structureLabel === "OK" && isFinite(s.roomTo2R as any) && (
+                  {s.structureLabel === "OK" && typeof s.roomTo2R === "number" && isFinite(s.roomTo2R) && (
                     <div style={{ ...subtle, marginTop: 8 }}>
-                      Structure: <b style={{ color: "#82f0b9" }}>OK</b> · Room:{" "}
-                      <b style={{ color: "#f2e7cd" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
+                      Structure: <b style={{ color: "#047857" }}>OK</b> · Room:{" "}
+                      <b style={{ color: "#111827" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
                     </div>
                   )}
                 </div>
@@ -1537,7 +2687,7 @@ export default function App() {
           </div>
 
           <div style={{ ...subtle, marginTop: 12 }}>
-            Tip: a coin can be “active” but still <b style={{ color: "#ffb6b6" }}>NO EDGE</b> if it fails 2R room or dumps fast. That’s intentional — it protects you.
+            Tip: a coin can be “active” but still <b style={{ color: "#b91c1c" }}>NO EDGE</b> if it fails 2R room or dumps fast. That’s intentional — it protects you.
           </div>
         </div>
 
@@ -1545,7 +2695,7 @@ export default function App() {
         <div style={panel}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
             <div>
-              <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>POSITION SIZING + TP/SL</div>
+              <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>POSITION SIZING + TP/SL</div>
               <div style={{ ...subtle, marginTop: 4 }}>
                 Stops must be structural. The calculator helps size; you decide structure.
               </div>
@@ -1574,45 +2724,45 @@ export default function App() {
             </div>
           </div>
 
-          <div style={{ marginTop: 12, borderRadius: 14, border: "1px dashed rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.20)", padding: 12 }}>
+          <div style={{ marginTop: 12, borderRadius: 14, border: "1px dashed #cbd5e1", background: "#f8fafc", padding: 12 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
-                <div style={{ fontWeight: 900, color: "#d8c79f" }}>LONG PLAN</div>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
+                <div style={{ fontWeight: 900, color: "#0f766e" }}>LONG PLAN</div>
                 <div style={{ ...subtle, marginTop: 6 }}>
-                  Stop Dist: <b style={{ color: "#f2e7cd" }}>{stopDistanceLong > 0 ? fmtUsd(stopDistanceLong) : "—"}</b>
+                  Stop Dist: <b style={{ color: "#111827" }}>{stopDistanceLong > 0 ? fmtUsd(stopDistanceLong) : "—"}</b>
                 </div>
                 <div style={{ ...subtle }}>
-                  Size: <b style={{ color: "#f2e7cd" }}>{positionSizeLong > 0 ? `${positionSizeLong.toFixed(6)} ${focusSymbol}` : "—"}</b>
+                  Size: <b style={{ color: "#111827" }}>{positionSizeLong > 0 ? `${positionSizeLong.toFixed(6)} ${focusSymbol}` : "—"}</b>
                 </div>
                 <div style={{ ...subtle, marginTop: 6 }}>
-                  TP1: <b style={{ color: "#f2e7cd" }}>{tp1Long > 0 ? fmtUsd(tp1Long) : "—"}</b>
+                  TP1: <b style={{ color: "#111827" }}>{tp1Long > 0 ? fmtUsd(tp1Long) : "—"}</b>
                 </div>
                 <div style={{ ...subtle }}>
-                  TP2: <b style={{ color: "#f2e7cd" }}>{tp2Long > 0 ? fmtUsd(tp2Long) : "—"}</b>
+                  TP2: <b style={{ color: "#111827" }}>{tp2Long > 0 ? fmtUsd(tp2Long) : "—"}</b>
                 </div>
-                {stopDistanceLong <= 0 && <div style={{ marginTop: 8, color: "#ffb6b6", fontWeight: 900 }}>Long invalid: Stop must be below Entry</div>}
+                {stopDistanceLong <= 0 && <div style={{ marginTop: 8, color: "#b91c1c", fontWeight: 900 }}>Long invalid: Stop must be below Entry</div>}
               </div>
 
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
-                <div style={{ fontWeight: 900, color: "#d8c79f" }}>SHORT PLAN</div>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
+                <div style={{ fontWeight: 900, color: "#0f766e" }}>SHORT PLAN</div>
                 <div style={{ ...subtle, marginTop: 6 }}>
-                  Stop Dist: <b style={{ color: "#f2e7cd" }}>{stopDistanceShort > 0 ? fmtUsd(stopDistanceShort) : "—"}</b>
+                  Stop Dist: <b style={{ color: "#111827" }}>{stopDistanceShort > 0 ? fmtUsd(stopDistanceShort) : "—"}</b>
                 </div>
                 <div style={{ ...subtle }}>
-                  Size: <b style={{ color: "#f2e7cd" }}>{positionSizeShort > 0 ? `${positionSizeShort.toFixed(6)} ${focusSymbol}` : "—"}</b>
+                  Size: <b style={{ color: "#111827" }}>{positionSizeShort > 0 ? `${positionSizeShort.toFixed(6)} ${focusSymbol}` : "—"}</b>
                 </div>
                 <div style={{ ...subtle, marginTop: 6 }}>
-                  TP1: <b style={{ color: "#f2e7cd" }}>{tp1Short > 0 ? fmtUsd(tp1Short) : "—"}</b>
+                  TP1: <b style={{ color: "#111827" }}>{tp1Short > 0 ? fmtUsd(tp1Short) : "—"}</b>
                 </div>
                 <div style={{ ...subtle }}>
-                  TP2: <b style={{ color: "#f2e7cd" }}>{tp2Short > 0 ? fmtUsd(tp2Short) : "—"}</b>
+                  TP2: <b style={{ color: "#111827" }}>{tp2Short > 0 ? fmtUsd(tp2Short) : "—"}</b>
                 </div>
-                {stopDistanceShort <= 0 && <div style={{ marginTop: 8, color: "#ffb6b6", fontWeight: 900 }}>Short invalid: Stop must be above Entry</div>}
+                {stopDistanceShort <= 0 && <div style={{ marginTop: 8, color: "#b91c1c", fontWeight: 900 }}>Short invalid: Stop must be above Entry</div>}
               </div>
             </div>
 
             <div style={{ marginTop: 10, ...subtle }}>
-              Risk Amount: <b style={{ color: "#f2e7cd" }}>{fmtUsd(riskAmount)}</b> · If you can’t define a structural stop, you don’t have a trade.
+              Risk Amount: <b style={{ color: "#111827" }}>{fmtUsd(riskAmount)}</b> · If you can’t define a structural stop, you don’t have a trade.
             </div>
           </div>
         </div>
@@ -1620,32 +2770,32 @@ export default function App() {
         {/* COL 3 — Session Guard + Rules */}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <div style={panel}>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>SESSION GUARD</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>SESSION GUARD</div>
 
             <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
                 <div style={subtle}>Trades today</div>
                 <div style={{ fontWeight: 950, fontSize: "1.2rem" }}>
                   {tradesToday} / {commitRequired ? "—" : commit?.maxTrades}
                 </div>
               </div>
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
                 <div style={subtle}>R today</div>
-                <div style={{ fontWeight: 950, fontSize: "1.2rem", color: rToday >= 0 ? "#82f0b9" : "#ffb6b6" }}>{fmtR(rToday)}</div>
+                <div style={{ fontWeight: 950, fontSize: "1.2rem", color: rToday >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(rToday)}</div>
               </div>
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
                 <div style={subtle}>Consecutive losses</div>
                 <div style={{ fontWeight: 950, fontSize: "1.2rem" }}>{consecutiveLosses}</div>
               </div>
-              <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10 }}>
+              <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 10 }}>
                 <div style={subtle}>Status</div>
-                <div style={{ fontWeight: 950, fontSize: "1.05rem", color: dayState.locked ? "#ffb6b6" : "#f2e7cd" }}>
+                <div style={{ fontWeight: 950, fontSize: "1.05rem", color: dayState.locked ? "#b91c1c" : "#111827" }}>
                   {dayState.locked ? "SESSION COMPLETE" : "ACTIVE"}
                 </div>
               </div>
             </div>
 
-            <div style={{ marginTop: 10, borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 10, background: "rgba(0,0,0,0.18)" }}>
+            <div style={{ marginTop: 10, borderRadius: 12, border: "1px solid #e2e8f0", padding: 10, background: "#f8fafc" }}>
               <div style={{ fontWeight: 900, color: processMessage.tone }}>{processMessage.text}</div>
               {dayState.locked && dayState.lockedReason && <div style={{ ...subtle, marginTop: 6 }}>{dayState.lockedReason}</div>}
             </div>
@@ -1661,24 +2811,24 @@ export default function App() {
           </div>
 
           <div style={panel}>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>RULES (BASICS)</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>RULES (BASICS)</div>
             <div style={{ ...subtle, marginTop: 10, lineHeight: 1.6 }}>
-              <b style={{ color: "#f2e7cd" }}>A+ only</b>
+              <b style={{ color: "#111827" }}>A+ only</b>
               <br />
               VALID entry · Structure OK · Score ≥ 70 · Vol ≥ 1.3x · Clear 2R room
               <br />
               <br />
-              <b style={{ color: "#f2e7cd" }}>Risk stays small</b>
+              <b style={{ color: "#111827" }}>Risk stays small</b>
               <br />
               1–2% per trade · Stop after 2 losses or -2R
               <br />
               <br />
-              <b style={{ color: "#f2e7cd" }}>Stop is structural</b>
+              <b style={{ color: "#111827" }}>Stop is structural</b>
               <br />
               Swing low / failed retest — never random %
               <br />
               <br />
-              <b style={{ color: "#f2e7cd" }}>Do not chase</b>
+              <b style={{ color: "#111827" }}>Do not chase</b>
               <br />
               EXTENDED / STRUCTURE WAIT / NO EDGE means WAIT for base, pullback, or reclaim
             </div>
@@ -1690,13 +2840,13 @@ export default function App() {
       <div style={grid2}>
         <div style={panel}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
             <span style={pill}>Revolut universe</span>
           </div>
 
           <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <input style={input} placeholder="Search coins (symbol or name)…" value={query} onChange={(e) => setQuery(e.target.value)} />
-            <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#bdbdbd", fontWeight: 800 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#64748b", fontWeight: 800 }}>
               <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
               Auto (5m)
             </label>
@@ -1705,7 +2855,7 @@ export default function App() {
           <div style={{ marginTop: 10, overflow: "auto", maxHeight: 420 }}>
             <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "0 8px" }}>
               <thead>
-                <tr style={{ color: "#9a9a9a", fontSize: "0.78rem", textAlign: "left" }}>
+                <tr style={{ color: "#64748b", fontSize: "0.78rem", textAlign: "left" }}>
                   <th style={{ paddingLeft: 8 }}>Coin</th>
                   <th>Price</th>
                   <th>24h</th>
@@ -1730,7 +2880,7 @@ export default function App() {
                         }
                       }}
                       style={{
-                        background: "rgba(0,0,0,0.20)",
+                        background: "#f8fafc",
                         cursor: allowed ? "pointer" : "not-allowed",
                         opacity: allowed ? 1 : 0.55,
                       }}
@@ -1738,17 +2888,17 @@ export default function App() {
                     >
                       <td style={{ padding: "10px 8px", fontWeight: 950 }}>{s.symbol}</td>
                       <td style={{ padding: "10px 8px", fontWeight: 800 }}>{fmtUsd(s.priceUsd)}</td>
-                      <td style={{ padding: "10px 8px", fontWeight: 900, color: (s.change24h ?? 0) >= 0 ? "#82f0b9" : "#ff8a8a" }}>
+                      <td style={{ padding: "10px 8px", fontWeight: 900, color: (s.change24h ?? 0) >= 0 ? "#047857" : "#b91c1c" }}>
                         {s.change24h === undefined ? "—" : `${s.change24h >= 0 ? "+" : ""}${fmtPct(s.change24h)}`}
                       </td>
-                      <td style={{ padding: "10px 8px", color: "#bdbdbd", fontWeight: 800 }}>
+                      <td style={{ padding: "10px 8px", color: "#64748b", fontWeight: 800 }}>
                         {isFinite(s.volFactor) ? `${s.volFactor.toFixed(2)}x` : "—"}
                       </td>
                       <td
                         style={{
                           padding: "10px 8px",
                           fontWeight: 950,
-                          color: s.entryQuality === "VALID" ? "#82f0b9" : s.entryQuality === "EXTENDED" ? "#f2e7cd" : "#ffb6b6",
+                          color: s.entryQuality === "VALID" ? "#047857" : s.entryQuality === "EXTENDED" ? "#111827" : "#b91c1c",
                         }}
                       >
                         {s.entryQuality}
@@ -1757,7 +2907,7 @@ export default function App() {
                         style={{
                           padding: "10px 8px",
                           fontWeight: 950,
-                          color: s.structureLabel === "OK" ? "#82f0b9" : s.structureLabel === "WAIT" ? "#f2e7cd" : "#ffb6b6",
+                          color: s.structureLabel === "OK" ? "#047857" : s.structureLabel === "WAIT" ? "#111827" : "#b91c1c",
                         }}
                       >
                         {s.structureLabel}
@@ -1773,14 +2923,14 @@ export default function App() {
           </div>
 
           <div style={{ ...subtle, marginTop: 10 }}>
-            Focus: <b style={{ color: "#f2e7cd" }}>{focusSymbol}</b> · Tradable requires <b style={{ color: "#82f0b9" }}>VALID</b> +{" "}
-            <b style={{ color: "#82f0b9" }}>Structure OK</b>.
+            Focus: <b style={{ color: "#111827" }}>{focusSymbol}</b> · Tradable requires <b style={{ color: "#047857" }}>VALID</b> +{" "}
+            <b style={{ color: "#047857" }}>Structure OK</b>.
           </div>
         </div>
 
         <div style={panel}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>MARKET HEATMAP</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>MARKET HEATMAP</div>
             <span style={pill}>Gold ≥ 80 · Green ≥ 65</span>
           </div>
 
@@ -1795,21 +2945,21 @@ export default function App() {
           </div>
 
           {bestSetup && (
-            <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 12, background: "rgba(0,0,0,0.18)" }}>
-              <div style={{ fontWeight: 950, color: "#f2e7cd" }}>Best right now (strict): {bestSetup.symbol}</div>
+            <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid #e2e8f0", padding: 12, background: "#f8fafc" }}>
+              <div style={{ fontWeight: 950, color: "#111827" }}>Best right now (strict): {bestSetup.symbol}</div>
               <div style={{ ...subtle, marginTop: 6 }}>
                 Entry:{" "}
-                <b style={{ color: bestSetup.entryQuality === "VALID" ? "#82f0b9" : bestSetup.entryQuality === "EXTENDED" ? "#f2e7cd" : "#ffb6b6" }}>
+                <b style={{ color: bestSetup.entryQuality === "VALID" ? "#047857" : bestSetup.entryQuality === "EXTENDED" ? "#111827" : "#b91c1c" }}>
                   {bestSetup.entryQuality}
                 </b>
                 {" · "}
                 Structure:{" "}
-                <b style={{ color: bestSetup.structureLabel === "OK" ? "#82f0b9" : bestSetup.structureLabel === "WAIT" ? "#f2e7cd" : "#ffb6b6" }}>
+                <b style={{ color: bestSetup.structureLabel === "OK" ? "#047857" : bestSetup.structureLabel === "WAIT" ? "#111827" : "#b91c1c" }}>
                   {bestSetup.structureLabel}
                 </b>
                 {bestSetup.roomTo2R !== undefined && (
                   <>
-                    {" · "}Room: <b style={{ color: "#f2e7cd" }}>{bestSetup.roomTo2R.toFixed(2)}R</b>
+                    {" · "}Room: <b style={{ color: "#111827" }}>{bestSetup.roomTo2R.toFixed(2)}R</b>
                   </>
                 )}
               </div>
@@ -1837,7 +2987,7 @@ export default function App() {
       <div style={panel}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
           <div>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>BEST TO CONSIDER NOW (STRICT)</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>BEST TO CONSIDER NOW (STRICT)</div>
             <div style={{ ...subtle, marginTop: 6 }}>
               Filter: EntryQuality=VALID · Structure=OK · Combined ≥ 70 · 1h ≥ 65 · Vol ≥ 1.3x.
             </div>
@@ -1880,7 +3030,7 @@ export default function App() {
                   1h: {Math.round(s.score1h)} · 15m: {Math.round(s.score15m)} · Vol: {s.volFactor.toFixed(2)}x
                 </div>
                 <div style={{ ...subtle, marginTop: 8 }}>
-                  Room: <b style={{ color: "#f2e7cd" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
+                  Room: <b style={{ color: "#111827" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
                 </div>
               </div>
             );
@@ -1893,7 +3043,7 @@ export default function App() {
       <div style={{ ...panel, marginTop: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
           <div>
-            <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>FULL SCANNER</div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>FULL SCANNER</div>
             <div style={{ ...subtle, marginTop: 6 }}>Includes Entry Quality + Structure reasons so you don’t chase.</div>
           </div>
           <input style={input} placeholder="Search…" value={query} onChange={(e) => setQuery(e.target.value)} />
@@ -1908,7 +3058,7 @@ export default function App() {
                 style={{
                   borderRadius: 14,
                   border: "1px solid rgba(255,255,255,0.07)",
-                  background: "rgba(0,0,0,0.22)",
+                  background: "#f8fafc",
                   padding: 12,
                   marginBottom: 10,
                   display: "flex",
@@ -1924,16 +3074,16 @@ export default function App() {
                   </div>
                   <div style={{ ...subtle, marginTop: 6 }}>
                     15m {Math.round(s.score15m)} · 1h {Math.round(s.score1h)} · Vol {s.volFactor.toFixed(2)}x · Entry{" "}
-                    <b style={{ color: s.entryQuality === "VALID" ? "#82f0b9" : s.entryQuality === "EXTENDED" ? "#f2e7cd" : "#ffb6b6" }}>
+                    <b style={{ color: s.entryQuality === "VALID" ? "#047857" : s.entryQuality === "EXTENDED" ? "#111827" : "#b91c1c" }}>
                       {s.entryQuality}
                     </b>
                     {" · "}Structure{" "}
-                    <b style={{ color: s.structureLabel === "OK" ? "#82f0b9" : s.structureLabel === "WAIT" ? "#f2e7cd" : "#ffb6b6" }}>
+                    <b style={{ color: s.structureLabel === "OK" ? "#047857" : s.structureLabel === "WAIT" ? "#111827" : "#b91c1c" }}>
                       {s.structureLabel}
                     </b>
                     {s.roomTo2R !== undefined && (
                       <>
-                        {" · "}Room <b style={{ color: "#f2e7cd" }}>{s.roomTo2R.toFixed(2)}R</b>
+                        {" · "}Room <b style={{ color: "#111827" }}>{s.roomTo2R.toFixed(2)}R</b>
                       </>
                     )}
                   </div>
@@ -1970,21 +3120,21 @@ export default function App() {
 
   const Journal = () => (
     <div style={panel}>
-      <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>TRADE JOURNAL (TODAY)</div>
+      <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>TRADE JOURNAL (TODAY)</div>
       <div style={{ ...subtle, marginTop: 8 }}>
         Your job is to follow rules. Outcomes vary. The journal restores trust through evidence.
       </div>
 
       <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-        <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 12 }}>
+        <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 12 }}>
           <div style={subtle}>Trades</div>
           <div style={{ fontWeight: 950, fontSize: "1.3rem" }}>{tradesToday}</div>
         </div>
-        <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 12 }}>
+        <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 12 }}>
           <div style={subtle}>R today</div>
-          <div style={{ fontWeight: 950, fontSize: "1.3rem", color: rToday >= 0 ? "#82f0b9" : "#ffb6b6" }}>{fmtR(rToday)}</div>
+          <div style={{ fontWeight: 950, fontSize: "1.3rem", color: rToday >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(rToday)}</div>
         </div>
-        <div style={{ borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 12 }}>
+        <div style={{ borderRadius: 12, border: "1px solid #e2e8f0", padding: 12 }}>
           <div style={subtle}>Rules followed</div>
           <div style={{ fontWeight: 950, fontSize: "1.3rem" }}>
             {dayState.trades.filter((t) => t.rulesFollowed).length}/{dayState.trades.length || 0}
@@ -1995,6 +3145,9 @@ export default function App() {
       <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
         <button style={tradingAllowed ? btn : btnDisabled} disabled={!tradingAllowed} onClick={openLogFromCurrent}>
           Log Trade
+        </button>
+        <button style={btn} onClick={exportJournalCsv} disabled={!dayState.trades.length}>
+          Export CSV
         </button>
         <button style={btnDanger} onClick={endSessionNow} disabled={dayState.locked}>
           END SESSION
@@ -2007,7 +3160,7 @@ export default function App() {
         ) : (
           <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "0 10px" }}>
             <thead>
-              <tr style={{ color: "#9a9a9a", fontSize: "0.78rem", textAlign: "left" }}>
+              <tr style={{ color: "#64748b", fontSize: "0.78rem", textAlign: "left" }}>
                 <th style={{ paddingLeft: 8 }}>Time</th>
                 <th>Coin</th>
                 <th>Side</th>
@@ -2024,7 +3177,7 @@ export default function App() {
                 .slice()
                 .reverse()
                 .map((t) => (
-                  <tr key={t.id} style={{ background: "rgba(0,0,0,0.20)" }}>
+                  <tr key={t.id} style={{ background: "#f8fafc" }}>
                     <td style={{ padding: "10px 8px" }}>
                       {new Date(t.tsIso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     </td>
@@ -2033,11 +3186,11 @@ export default function App() {
                     <td style={{ padding: "10px 8px" }}>{fmtUsd(t.entry)}</td>
                     <td style={{ padding: "10px 8px" }}>{fmtUsd(t.stop)}</td>
                     <td style={{ padding: "10px 8px" }}>{fmtUsd(t.exit)}</td>
-                    <td style={{ padding: "10px 8px", fontWeight: 950, color: t.r >= 0 ? "#82f0b9" : "#ffb6b6" }}>{fmtR(t.r)}</td>
-                    <td style={{ padding: "10px 8px", fontWeight: 900, color: t.rulesFollowed ? "#82f0b9" : "#ffb6b6" }}>
+                    <td style={{ padding: "10px 8px", fontWeight: 950, color: t.r >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(t.r)}</td>
+                    <td style={{ padding: "10px 8px", fontWeight: 900, color: t.rulesFollowed ? "#047857" : "#b91c1c" }}>
                       {t.rulesFollowed ? "YES" : "NO"}
                     </td>
-                    <td style={{ padding: "10px 8px", color: "#bdbdbd" }}>{t.note ?? ""}</td>
+                    <td style={{ padding: "10px 8px", color: "#64748b" }}>{t.note ?? ""}</td>
                   </tr>
                 ))}
             </tbody>
@@ -2047,13 +3200,1394 @@ export default function App() {
     </div>
   );
 
-  const History = () => (
-    <div style={panel}>
-      <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>HISTORY</div>
-      <div style={{ ...subtle, marginTop: 10 }}>
-        Next: multi-day stats (expectancy, best session, best coins, rule-break cost).
+  const History = () => {
+    const wins = dayState.trades.filter((t) => t.r > 0).length;
+    const losses = dayState.trades.filter((t) => t.r < 0).length;
+    const ruleBreaks = dayState.trades.filter((t) => !t.rulesFollowed);
+    const ruleBreakCost = ruleBreaks.reduce((acc, t) => acc + t.r, 0);
+    const expectancy = dayState.trades.length ? rToday / dayState.trades.length : 0;
+    const winRate = dayState.trades.length ? (wins / dayState.trades.length) * 100 : 0;
+
+    return (
+      <div style={panel}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>PERFORMANCE COCKPIT</div>
+            <div style={{ ...subtle, marginTop: 6 }}>Today’s evidence: expectancy, discipline cost, and whether the system kept you out of bad trades.</div>
+          </div>
+          <button style={btn} onClick={exportJournalCsv} disabled={!dayState.trades.length}>
+            Export CSV
+          </button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+          <div style={statCard}>
+            <div style={subtle}>Expectancy</div>
+            <div style={{ fontWeight: 950, fontSize: "1.4rem", color: expectancy >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(expectancy)}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Win rate</div>
+            <div style={{ fontWeight: 950, fontSize: "1.4rem" }}>{winRate.toFixed(0)}%</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Wins / losses</div>
+            <div style={{ fontWeight: 950, fontSize: "1.4rem" }}>{wins} / {losses}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Rule-break cost</div>
+            <div style={{ fontWeight: 950, fontSize: "1.4rem", color: ruleBreakCost >= 0 ? "#047857" : "#b91c1c" }}>{fmtR(ruleBreakCost)}</div>
+          </div>
+        </div>
+
+        <div style={{ ...proPanel, marginTop: 14 }}>
+          <div style={{ color: "#111827", fontWeight: 950 }}>Pro insight</div>
+          <div style={{ ...subtle, marginTop: 8 }}>
+            {proPass
+              ? `Scanner blocked ${watchlistHealth.blocked} risky-looking setups today. That is the product: fewer forced trades, cleaner sizing, and exportable evidence.`
+              : `Unlock Pro to turn this into a sellable command center: strict signal alerts, CSV exports, lead capture, and checkout-ready access at ${PRO_PRICE}.`}
+          </div>
+          {!proPass && (
+            <button style={{ ...btnDanger, marginTop: 12 }} onClick={() => setTab("pro")}>
+              See Pro
+            </button>
+          )}
+        </div>
       </div>
-    </div>
+    );
+  };
+
+  const Plan = () => {
+    const targetUsd = goalPlanDraft.startingEquityUsd * (goalPlanDraft.targetReturnPct / 100);
+    const horizonDays = goalPeriodDays(goalPlanDraft.targetPeriod);
+    const generatedStrategy = strategyFromGoal(goalPlanDraft.targetReturnPct, goalPlanDraft.targetPeriod);
+    const maxLossUsd = goalPlanDraft.startingEquityUsd * (goalPlanDraft.maxDailyLossPct / 100);
+    const targetPerTradePct = goalPlanDraft.maxTradesPerDay > 0 ? generatedStrategy.dailyTargetPct / goalPlanDraft.maxTradesPerDay : generatedStrategy.dailyTargetPct;
+    const requiredWinRatePct = clamp(48 + generatedStrategy.dailyTargetPct * 10 - goalPlanDraft.riskPerTradePct * 3, 35, 88);
+    const riskTone =
+      generatedStrategy.dailyTargetPct >= 2 || goalPlanDraft.maxDailyLossPct >= 2
+        ? { label: "AGGRESSIVE", color: "#b91c1c" }
+        : generatedStrategy.dailyTargetPct >= 0.65
+          ? { label: "ACTIVE", color: "#92400e" }
+          : { label: "CONTROLLED", color: "#047857" };
+    const updateDraftNumber = (key: GoalPlanNumberKey, value: string) => {
+      const clean = value.replace(/[^\d.]/g, "");
+      setGoalPlanInputText((prev) => ({ ...prev, [key]: clean }));
+      if (!clean.trim() || clean === ".") return;
+      const parsed = Number(clean);
+      if (Number.isFinite(parsed)) setGoalPlanDraft((prev) => ({ ...prev, [key]: Math.max(0, parsed) }));
+    };
+    const normalizeDraftNumber = (key: GoalPlanNumberKey) => {
+      setGoalPlanInputText((prev) => ({ ...prev, [key]: String(goalPlanDraft[key]) }));
+    };
+    const periodButton = (period: GoalPeriod): React.CSSProperties => ({
+      ...(goalPlanDraft.targetPeriod === period ? btn : { ...btn, background: "#ffffff", color: "#0f766e" }),
+      width: "100%",
+      padding: "10px 12px",
+    });
+    const applyGeneratedStrategy = () => {
+      const nextDraft = {
+        ...goalPlanDraft,
+        maxDailyLossPct: generatedStrategy.maxDailyLossPct,
+        maxTradesPerDay: generatedStrategy.maxTradesPerDay,
+        maxOpenPositions: generatedStrategy.maxOpenPositions,
+        riskPerTradePct: generatedStrategy.riskPerTradePct,
+        minConfidence: generatedStrategy.minConfidence,
+        notes: generatedStrategy.notes,
+      };
+      setGoalPlanDraft((prev) => ({
+        ...prev,
+        maxDailyLossPct: generatedStrategy.maxDailyLossPct,
+        maxTradesPerDay: generatedStrategy.maxTradesPerDay,
+        maxOpenPositions: generatedStrategy.maxOpenPositions,
+        riskPerTradePct: generatedStrategy.riskPerTradePct,
+        minConfidence: generatedStrategy.minConfidence,
+        notes: generatedStrategy.notes,
+      }));
+      setGoalPlanInputText(goalPlanNumberText(nextDraft));
+    };
+    const acceptPlan = () => {
+      const next: GoalPlan = {
+        ...goalPlanDraft,
+        targetReturnPct: clamp(goalPlanDraft.targetReturnPct, 0.1, 25),
+        horizonDays,
+        dailyTargetPct: generatedStrategy.dailyTargetPct,
+        strategyProfile: generatedStrategy.profile,
+        startingEquityUsd: Math.max(100, goalPlanDraft.startingEquityUsd || simState.startingCashUsd),
+        maxDailyLossPct: clamp(goalPlanDraft.maxDailyLossPct, 0.1, 20),
+        maxTradesPerDay: Math.max(1, Math.round(goalPlanDraft.maxTradesPerDay || 1)),
+        maxOpenPositions: Math.max(1, Math.round(goalPlanDraft.maxOpenPositions || 1)),
+        riskPerTradePct: clamp(goalPlanDraft.riskPerTradePct, 0.1, 10),
+        minConfidence: clamp(goalPlanDraft.minConfidence, 50, 95),
+        id: `plan-${Date.now()}`,
+        createdAtIso: goalPlan?.createdAtIso ?? new Date().toISOString(),
+        acceptedAtIso: new Date().toISOString(),
+        requiredWinRatePct,
+        acceptedRisk: true,
+      };
+      setGoalPlan(next);
+      setAccountUsd(next.startingEquityUsd);
+      setRiskPct(next.riskPerTradePct);
+      setGoalRiskAccepted(false);
+      setTab("simulator");
+    };
+
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "0.95fr 1.05fr", gap: 14 }}>
+        <div style={panel}>
+          <div style={sectionTitle}>COMMITMENT PLAN</div>
+          <div style={{ ...subtle, marginTop: 6 }}>
+            Set the exact outcome you want, accept the risk, then the simulator AI uses these rules to size, block, and review trades.
+          </div>
+
+          <div style={{ display: "grid", gap: 10, marginTop: 14 }}>
+            <label>
+              <div style={subtle}>Goal name</div>
+              <input
+                style={input}
+                value={goalPlanDraft.goalName}
+                onChange={(e) => setGoalPlanDraft((prev) => ({ ...prev, goalName: e.target.value }))}
+              />
+            </label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <label>
+                <div style={subtle}>Profit target (%)</div>
+                <input
+                  style={input}
+                  inputMode="decimal"
+                  value={goalPlanInputText.targetReturnPct}
+                  onChange={(e) => updateDraftNumber("targetReturnPct", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("targetReturnPct")}
+                />
+              </label>
+              <div>
+                <div style={subtle}>Target period</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                  {[
+                    ["day", "Day"],
+                    ["week", "Week"],
+                    ["month", "Month"],
+                  ].map(([period, label]) => (
+                    <button
+                      key={period}
+                      type="button"
+                      style={periodButton(period as GoalPeriod)}
+                      onClick={() => setGoalPlanDraft((prev) => ({ ...prev, targetPeriod: period as GoalPeriod }))}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <label>
+                <div style={subtle}>Starting equity ($)</div>
+                <input
+                  style={input}
+                  inputMode="decimal"
+                  value={goalPlanInputText.startingEquityUsd}
+                  onChange={(e) => updateDraftNumber("startingEquityUsd", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("startingEquityUsd")}
+                />
+              </label>
+              <label>
+                <div style={subtle}>Max daily loss (%)</div>
+                <input
+                  style={input}
+                  inputMode="decimal"
+                  value={goalPlanInputText.maxDailyLossPct}
+                  onChange={(e) => updateDraftNumber("maxDailyLossPct", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("maxDailyLossPct")}
+                />
+              </label>
+              <label>
+                <div style={subtle}>Max trades/day</div>
+                <input
+                  style={input}
+                  inputMode="numeric"
+                  value={goalPlanInputText.maxTradesPerDay}
+                  onChange={(e) => updateDraftNumber("maxTradesPerDay", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("maxTradesPerDay")}
+                />
+              </label>
+              <label>
+                <div style={subtle}>Max open holdings</div>
+                <input
+                  style={input}
+                  inputMode="numeric"
+                  value={goalPlanInputText.maxOpenPositions}
+                  onChange={(e) => updateDraftNumber("maxOpenPositions", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("maxOpenPositions")}
+                />
+              </label>
+              <label>
+                <div style={subtle}>Risk per trade (%)</div>
+                <input
+                  style={input}
+                  inputMode="decimal"
+                  value={goalPlanInputText.riskPerTradePct}
+                  onChange={(e) => updateDraftNumber("riskPerTradePct", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("riskPerTradePct")}
+                />
+              </label>
+              <label>
+                <div style={subtle}>Minimum AI confidence</div>
+                <input
+                  style={input}
+                  inputMode="numeric"
+                  value={goalPlanInputText.minConfidence}
+                  onChange={(e) => updateDraftNumber("minConfidence", e.target.value)}
+                  onBlur={() => normalizeDraftNumber("minConfidence")}
+                />
+              </label>
+            </div>
+            <div style={{ ...proPanel }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 950, color: "#111827" }}>Generated strategy: {generatedStrategy.profile}</div>
+                  <div style={{ ...subtle, marginTop: 6 }}>
+                    {goalPlanDraft.targetReturnPct}% per {goalPlanDraft.targetPeriod} equals about {generatedStrategy.dailyTargetPct.toFixed(2)}% per day.
+                  </div>
+                </div>
+                <button style={btn} onClick={applyGeneratedStrategy}>
+                  Use Suggested Rules
+                </button>
+              </div>
+              <div style={{ ...subtle, marginTop: 10 }}>{generatedStrategy.notes}</div>
+            </div>
+            <label>
+              <div style={subtle}>Notes</div>
+              <input
+                style={input}
+                value={goalPlanDraft.notes}
+                onChange={(e) => setGoalPlanDraft((prev) => ({ ...prev, notes: e.target.value }))}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div style={panel}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>RISK ACCEPTANCE</div>
+              <div style={{ ...subtle, marginTop: 6 }}>The app turns the goal into trade rules. The stop rules override the profit target.</div>
+            </div>
+            <span style={{ ...pill, color: riskTone.color }}>{riskTone.label}</span>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+            <div style={statCard}>
+              <div style={subtle}>Target / {goalPlanDraft.targetPeriod}</div>
+              <div style={{ fontWeight: 950, color: "#047857" }}>{fmtUsd(targetUsd)}</div>
+            </div>
+            <div style={statCard}>
+              <div style={subtle}>Loss cap</div>
+              <div style={{ fontWeight: 950, color: "#b91c1c" }}>{fmtUsd(maxLossUsd)}</div>
+            </div>
+            <div style={statCard}>
+              <div style={subtle}>Needed/trade/day</div>
+              <div style={{ fontWeight: 950 }}>{targetPerTradePct.toFixed(2)}%</div>
+            </div>
+            <div style={statCard}>
+              <div style={subtle}>Req. win rate</div>
+              <div style={{ fontWeight: 950 }}>{requiredWinRatePct.toFixed(0)}%+</div>
+            </div>
+          </div>
+
+          <div style={{ ...proPanel, marginTop: 14 }}>
+            <div style={{ fontWeight: 950, color: "#111827" }}>AI operating rules after acceptance</div>
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {[
+                `Only buy when scanner confidence is at least ${goalPlanDraft.minConfidence}%.`,
+                `Stop new buys if open holdings reach ${goalPlanDraft.maxOpenPositions}.`,
+                `Use about ${goalPlanDraft.riskPerTradePct}% of equity as the max AI sizing budget.`,
+                `Stop trading if sim P/L reaches -${goalPlanDraft.maxDailyLossPct}%.`,
+                `Protect the result once the plan reaches +${goalPlanDraft.targetReturnPct}% per ${goalPlanDraft.targetPeriod}.`,
+              ].map((rule) => (
+                <div key={rule} style={{ ...statCard, background: "#ffffff" }}>
+                  <div style={{ fontWeight: 900, color: "#111827" }}>{rule}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <label style={{ display: "flex", gap: 10, alignItems: "flex-start", marginTop: 14, color: "#475569", lineHeight: 1.5 }}>
+            <input type="checkbox" checked={goalRiskAccepted} onChange={(e) => setGoalRiskAccepted(e.target.checked)} style={{ marginTop: 4 }} />
+            <span>
+              I accept that this is simulator decision support, not financial advice. The target may be unrealistic, losses can happen fast, and the AI must stop when the plan risk cap is hit.
+            </span>
+          </label>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 14 }}>
+            <button style={goalRiskAccepted ? btnDanger : btnDisabled} disabled={!goalRiskAccepted} onClick={acceptPlan}>
+              Accept Risk + Generate Plan
+            </button>
+            <button
+              style={btn}
+              onClick={() => {
+                setGoalPlan(null);
+                setGoalRiskAccepted(false);
+              }}
+            >
+              Clear Active Plan
+            </button>
+          </div>
+
+          {goalPlan && (
+            <div style={{ ...statCard, marginTop: 14, borderColor: "#99f6e4", background: "#f0fdfa" }}>
+              <div style={{ fontWeight: 950, color: "#047857" }}>Active plan: {goalPlan.goalName}</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {goalPlan.strategyProfile} strategy: +{goalPlan.targetReturnPct}% per {goalPlan.targetPeriod}, about +{goalPlan.dailyTargetPct.toFixed(2)}% per day, with a -{goalPlan.maxDailyLossPct}% stop. Simulator AI is now enforcing it.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const Simulator = () => (
+    <>
+      <div style={{ ...panel, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={sectionTitle}>7-DAY SIM TRADING ACCOUNT</div>
+            <div style={{ ...subtle, marginTop: 6 }}>Choose a coin, buy with simulated cash, sell when your plan says sell, then review the week.</div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button style={btn} onClick={refresh} disabled={isLoading}>
+              {isLoading ? "Loading..." : "Refresh Market"}
+            </button>
+            <button style={btnDanger} onClick={resetSimulator}>
+              Reset Week
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12, height: 8, borderRadius: 999, background: "#e2e8f0", overflow: "hidden" }}>
+          <div
+            style={{
+              width: `${clamp((simElapsedDays / 7) * 100, 0, 100)}%`,
+              height: "100%",
+              background: simReturnPct >= 0 ? "linear-gradient(90deg, #047857, #0f766e)" : "linear-gradient(90deg, #b91c1c, #0f766e)",
+            }}
+          />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+          <div style={statCard}>
+            <div style={subtle}>Account Value</div>
+            <div style={{ fontWeight: 950, fontSize: "1.35rem", color: simEquity >= simState.startingCashUsd ? "#047857" : "#b91c1c" }}>
+              {fmtUsd(simEquity)}
+            </div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Cash</div>
+            <div style={{ fontWeight: 950, fontSize: "1.35rem" }}>{fmtUsd(simState.cashUsd)}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Holding P/L</div>
+            <div style={{ fontWeight: 950, fontSize: "1.35rem", color: simOpenPnl >= 0 ? "#047857" : "#b91c1c" }}>{fmtUsd(simOpenPnl)}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Realized P/L</div>
+            <div style={{ fontWeight: 950, fontSize: "1.35rem", color: simRealizedPnl >= 0 ? "#047857" : "#b91c1c" }}>{fmtUsd(simRealizedPnl)}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Week {simChallengeDay}/7</div>
+            <div style={{ fontWeight: 950, fontSize: "1.35rem", color: simReturnPct >= 0 ? "#047857" : "#b91c1c" }}>
+              {simReturnPct >= 0 ? "+" : ""}
+              {simReturnPct.toFixed(2)}%
+            </div>
+          </div>
+        </div>
+
+        <div style={{ ...proPanel, marginTop: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 14, alignItems: "center" }}>
+            <div>
+              <div style={sectionTitle}>{goalPlan ? "GOAL PLAN ACTIVE" : "NO ACCEPTED GOAL PLAN"}</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {goalPlan
+                  ? `${goalPlan.goalName}: ${goalPlan.strategyProfile} mode targeting +${goalPlan.targetReturnPct}% per ${goalPlan.targetPeriod} while respecting a -${goalPlan.maxDailyLossPct}% stop.`
+                  : "Create a commitment plan first. The AI will block new buys until a risk plan is accepted."}
+              </div>
+              <div style={{ marginTop: 12, height: 8, borderRadius: 999, background: "#dbeafe", overflow: "hidden" }}>
+                <div
+                  style={{
+                    width: `${clamp(Math.max(0, planProgress.progressPct), 0, 100)}%`,
+                    height: "100%",
+                    background: planProgress.status === "STOP HIT" ? "#b91c1c" : "linear-gradient(90deg, #0f766e, #047857)",
+                  }}
+                />
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
+              <div style={{ ...statCard, background: "#ffffff" }}>
+                <div style={subtle}>Goal progress</div>
+                <div style={{ fontWeight: 950, color: planProgress.pnlUsd >= 0 ? "#047857" : "#b91c1c" }}>
+                  {planProgress.progressPct.toFixed(0)}%
+                </div>
+              </div>
+              <div style={{ ...statCard, background: "#ffffff" }}>
+                <div style={subtle}>Need</div>
+                <div style={{ fontWeight: 950 }}>{fmtUsd(planProgress.targetUsd)}</div>
+              </div>
+              <div style={{ ...statCard, background: "#ffffff" }}>
+                <div style={subtle}>Status</div>
+                <div style={{ fontWeight: 950, color: planProgress.status === "STOP HIT" ? "#b91c1c" : planProgress.status === "GOAL HIT" ? "#047857" : "#111827" }}>
+                  {planProgress.status}
+                </div>
+              </div>
+            </div>
+          </div>
+          {!goalPlan && (
+            <button style={{ ...btnDanger, marginTop: 12 }} onClick={() => setTab("plan")}>
+              Build Commitment Plan
+            </button>
+          )}
+        </div>
+
+        <div style={{ ...panel, marginTop: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>REAL AI DAILY MARKET BRIEF</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                Uses the OpenAI API through a server function to read the scanner, plan, holdings, and sim history.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "center", color: "#475569", fontWeight: 900 }}>
+                <input type="checkbox" checked={liveNewsMode} onChange={(e) => setLiveNewsMode(e.target.checked)} />
+                Live news
+              </label>
+              <button style={aiAdvisorLoading ? btnDisabled : btnDanger} disabled={aiAdvisorLoading} onClick={requestAiAdvisor}>
+                {aiAdvisorLoading ? "Thinking..." : liveNewsMode ? "Generate Live Brief" : "Generate AI Brief"}
+              </button>
+            </div>
+          </div>
+
+          {aiAdvisorError && (
+            <div style={{ ...statCard, marginTop: 12, borderColor: "#fecaca", background: "#fff1f2" }}>
+              <div style={{ fontWeight: 950, color: "#b91c1c" }}>AI not connected</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {aiAdvisorError} The UI is ready, but no real AI brief can be generated until `OPENAI_API_KEY` is added to the server env and the dev server is restarted.
+              </div>
+            </div>
+          )}
+
+          {!aiAdvisor && !aiAdvisorError && (
+            <div style={{ ...emptyState, marginTop: 12 }}>
+              Generate a brief to get actual AI commentary on today’s trend, likely market-data catalysts, trade ideas, and portfolio actions.
+            </div>
+          )}
+
+          {aiAdvisor && (
+            <>
+              <div style={{ ...proPanel, marginTop: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontWeight: 950, color: "#111827", fontSize: "1.15rem" }}>{aiAdvisor.marketBrief.headline}</div>
+                    <div style={{ ...subtle, marginTop: 6 }}>
+                      Regime: <b style={{ color: "#111827" }}>{aiAdvisor.marketBrief.regime}</b>
+                      {aiAdvisor.model ? ` · Model: ${aiAdvisor.model}` : ""}
+                    </div>
+                  </div>
+                  {aiAdvisor.generatedAtIso && <span style={pill}>{new Date(aiAdvisor.generatedAtIso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
+                </div>
+                <div style={{ ...subtle, marginTop: 10 }}>{aiAdvisor.marketBrief.summary}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginTop: 12 }}>
+                  <div style={{ ...statCard, background: "#ffffff" }}>
+                    <div style={{ fontWeight: 950, color: "#047857" }}>What is moving it</div>
+                    <div style={{ ...subtle, marginTop: 8 }}>{aiAdvisor.marketBrief.catalysts.join(" ") || "No clear catalyst from supplied data."}</div>
+                    {aiAdvisor.marketBrief.sources.length > 0 && (
+                      <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+                        {aiAdvisor.marketBrief.sources.slice(0, 3).map((source) => (
+                          <a key={source.url} href={source.url} target="_blank" rel="noreferrer" style={{ color: "#0f766e", fontWeight: 900, fontSize: "0.78rem" }}>
+                            {source.title || source.url}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ ...statCard, background: "#ffffff" }}>
+                    <div style={{ fontWeight: 950, color: "#b91c1c" }}>Risks</div>
+                    <div style={{ ...subtle, marginTop: 8 }}>{aiAdvisor.marketBrief.risks.join(" ") || "No risk notes returned."}</div>
+                  </div>
+                  <div style={{ ...statCard, background: "#ffffff" }}>
+                    <div style={{ fontWeight: 950, color: "#111827" }}>Avoid</div>
+                    <div style={{ ...subtle, marginTop: 8 }}>{aiAdvisor.marketBrief.avoid.join(" ") || "No avoid list returned."}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 14, marginTop: 14 }}>
+                <div>
+                  <div style={sectionTitle}>AI TRADE IDEAS</div>
+                  <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
+                    {aiAdvisor.tradeIdeas.length === 0 ? (
+                      <div style={emptyState}>AI returned no trade ideas. That usually means wait.</div>
+                    ) : (
+                      aiAdvisor.tradeIdeas.map((idea) => (
+                        <div key={`${idea.symbol}-${idea.action}`} style={statCard}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                            <div>
+                              <div style={{ fontWeight: 950, color: idea.action === "BUY_TEST" ? "#047857" : idea.action === "AVOID" || idea.action === "SELL" ? "#b91c1c" : "#111827" }}>
+                                {idea.action.replace("_", " ")} {idea.symbol} · {Math.round(idea.confidence)}%
+                              </div>
+                              <div style={{ ...subtle, marginTop: 6 }}>{idea.thesis}</div>
+                            </div>
+                            <button style={idea.action === "BUY_TEST" || idea.action === "WATCH" ? btn : btnDisabled} disabled={idea.action !== "BUY_TEST" && idea.action !== "WATCH"} onClick={() => loadAiIdeaIntoTicket(idea)}>
+                              Load Into Sim
+                            </button>
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
+                            <div><div style={subtle}>Entry</div><div style={{ fontWeight: 900 }}>{idea.entryZone}</div></div>
+                            <div><div style={subtle}>Stop</div><div style={{ fontWeight: 900, color: "#b91c1c" }}>{idea.stop}</div></div>
+                            <div><div style={subtle}>Target</div><div style={{ fontWeight: 900, color: "#047857" }}>{idea.target}</div></div>
+                            <div><div style={subtle}>Hold</div><div style={{ fontWeight: 900 }}>{idea.holdTime}</div></div>
+                          </div>
+                          <div style={{ ...subtle, marginTop: 10 }}>
+                            Plan fit: {idea.planFit} {idea.reasons.join(" ")} {idea.warnings.length ? `Warnings: ${idea.warnings.join(" ")}` : ""}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div style={proPanel}>
+                  <div style={sectionTitle}>AI PORTFOLIO REVIEW</div>
+                  <div style={{ marginTop: 10, fontWeight: 950, color: "#111827" }}>{aiAdvisor.portfolioReview.summary}</div>
+                  <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+                    {aiAdvisor.portfolioReview.actions.map((action) => (
+                      <div key={action} style={{ ...statCard, background: "#ffffff" }}>
+                        <div style={{ fontWeight: 900 }}>{action}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ ...subtle, marginTop: 10 }}>{aiAdvisor.disclaimer}</div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div style={{ ...proPanel, marginTop: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>PORTFOLIO</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {simState.positions.length
+                  ? `${simState.positions.length} open holding${simState.positions.length === 1 ? "" : "s"} ready to sell below.`
+                  : "Nothing bought yet. Choose a coin and buy to start building the sim portfolio."}
+              </div>
+            </div>
+            <span style={{ ...pill, color: simState.positions.length ? "#047857" : "#111827" }}>
+              Holdings: {simState.positions.length}
+            </span>
+          </div>
+        </div>
+
+        <div style={{ ...panel, marginTop: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.05fr 0.95fr", gap: 14, alignItems: "stretch" }}>
+            <div>
+              <div style={sectionTitle}>AI ADVICE</div>
+              <div style={{ marginTop: 8, fontSize: "1.45rem", fontWeight: 950, color: aiAdvice.action === "BUY TEST" ? "#047857" : aiAdvice.action === "DO NOT BUY" ? "#b91c1c" : "#111827" }}>
+                {aiAdvice.action}: {aiAdvice.symbol}
+              </div>
+              <div style={{ ...subtle, marginTop: 8 }}>
+                {aiAdvice.when}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+                <div style={statCard}>
+                  <div style={subtle}>Entry Zone</div>
+                  <div style={{ fontWeight: 950 }}>{aiAdvice.price ? `${fmtUsd(aiAdvice.entryLow)} - ${fmtUsd(aiAdvice.entryHigh)}` : "Loading"}</div>
+                </div>
+                <div style={statCard}>
+                  <div style={subtle}>Stop</div>
+                  <div style={{ fontWeight: 950, color: "#b91c1c" }}>{aiAdvice.stop ? fmtUsd(aiAdvice.stop) : "Loading"}</div>
+                </div>
+                <div style={statCard}>
+                  <div style={subtle}>Target</div>
+                  <div style={{ fontWeight: 950, color: "#047857" }}>{aiAdvice.target ? fmtUsd(aiAdvice.target) : "Loading"}</div>
+                </div>
+                <div style={statCard}>
+                  <div style={subtle}>Hold Time</div>
+                  <div style={{ fontWeight: 950 }}>{aiAdvice.holdWindow}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+                <button
+                  style={aiAdvice.loadable ? btn : btnDisabled}
+                  disabled={!aiAdvice.loadable}
+                  onClick={() => {
+                    if (!aiAdvice.setup) return;
+                    setSimSymbol(aiAdvice.setup.symbol);
+                    setFocusSymbol(aiAdvice.setup.symbol);
+                    if (aiAdvice.price) {
+                      setEntryPrice(aiAdvice.price);
+                      setStopPrice(aiAdvice.stop || aiAdvice.price * 0.985);
+                    }
+                    setSimBuyUsd(String(Math.max(0, aiTradeBrief.suggestedUsd || advancedAi.maxTradeUsd || 100)));
+                    setSimThesis(`AI advice: ${aiAdvice.action} ${aiAdvice.symbol}. ${aiAdvice.when}`);
+                  }}
+                >
+                  Load Advice Into Ticket
+                </button>
+                <span style={{ ...pill, color: aiAdvice.confidence >= 78 ? "#047857" : "#b91c1c" }}>Advice confidence: {aiAdvice.confidence}%</span>
+              </div>
+            </div>
+
+            <div style={proPanel}>
+              <div style={sectionTitle}>SELL / INVALIDATE IF</div>
+              <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                {aiAdvice.invalidation.map((rule) => (
+                  <div key={rule} style={{ ...statCard, background: "#ffffff" }}>
+                    <div style={{ fontWeight: 900, color: "#111827" }}>{rule}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ ...subtle, marginTop: 10 }}>
+                This is simulator guidance, not a promise. The app is deliberately built to block weak trades and force a stop/target/hold plan before you buy.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ ...panel, marginTop: 14, background: "#f8fafc" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 14, alignItems: "center" }}>
+            <div>
+              <div style={sectionTitle}>AI COMMAND BRIEF</div>
+              <div style={{ marginTop: 8, fontSize: "1.25rem", fontWeight: 950, color: aiTradeBrief.tone }}>
+                {aiTradeBrief.action}: {aiTradeBrief.headline}
+              </div>
+              <div style={{ ...subtle, marginTop: 8 }}>
+                {proPass
+                  ? aiTradeBrief.reasons.join(" ")
+                  : `${aiTradeBrief.reasons[0]} Unlock Pro for the full decision chain, alerts, and weekly review.`}
+              </div>
+              {simSelectedHolding && (
+                <div style={{ ...subtle, marginTop: 8 }}>
+                  Current {simSymbol} holding P/L:{" "}
+                  <b style={{ color: simSelectedHoldingPnl >= 0 ? "#047857" : "#b91c1c" }}>{fmtUsd(simSelectedHoldingPnl)}</b>
+                </div>
+              )}
+            </div>
+            <div style={{ minWidth: 170, ...statCard }}>
+              <div style={subtle}>Confidence</div>
+              <div style={{ fontSize: "1.8rem", fontWeight: 950, color: aiTradeBrief.tone }}>{aiTradeBrief.confidence}%</div>
+              <div style={{ ...subtle, marginTop: 4 }}>Suggested sim size: {fmtUsd(aiTradeBrief.suggestedUsd)}</div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+          <div style={panel}>
+            <div style={sectionTitle}>ADVANCED AI EDGE ENGINE</div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              This is a stricter model: it estimates whether the setup still has edge after costs, then blocks trades that fail timing, structure, confidence, or exposure rules.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+              <div style={statCard}>
+                <div style={subtle}>Regime</div>
+                <div style={{ fontWeight: 950, color: advancedAi.marketRegime === "DEFENSIVE" ? "#b91c1c" : "#047857" }}>
+                  {advancedAi.marketRegime}
+                </div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Edge After Costs</div>
+                <div style={{ fontWeight: 950, color: advancedAi.scannerEdgePct > 0 ? "#047857" : "#b91c1c" }}>
+                  {advancedAi.scannerEdgePct >= 0 ? "+" : ""}
+                  {advancedAi.scannerEdgePct.toFixed(2)}%
+                </div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Risk State</div>
+                <div style={{ fontWeight: 950, color: advancedAi.riskState === "GREEN" ? "#047857" : advancedAi.riskState === "YELLOW" ? "#111827" : "#b91c1c" }}>
+                  {advancedAi.riskState}
+                </div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Max Trade</div>
+                <div style={{ fontWeight: 950, color: "#111827" }}>{fmtUsd(advancedAi.maxTradeUsd)}</div>
+              </div>
+            </div>
+
+            <div style={{ ...proPanel, marginTop: 12 }}>
+              <div style={{ color: advancedAi.shouldTrade ? "#047857" : "#b91c1c", fontWeight: 950 }}>
+                {advancedAi.shouldTrade ? "AI says this is tradable in the simulator." : "AI says do not buy yet."}
+              </div>
+              <div style={{ ...subtle, marginTop: 8 }}>
+                {advancedAi.blockers.length
+                  ? advancedAi.blockers.join(" ")
+                  : "No hard blockers. Still use the simulator first and respect the max trade size."}
+              </div>
+            </div>
+          </div>
+
+          <div style={panel}>
+            <div style={sectionTitle}>EXECUTION PLAN</div>
+            <div style={{ ...subtle, marginTop: 6 }}>The AI converts the scanner read into a repeatable trade plan instead of a guess.</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
+              {advancedAi.executionRules.map((rule) => (
+                <div key={rule} style={statCard}>
+                  <div style={{ fontWeight: 900, color: "#111827" }}>{rule}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ ...statCard, marginTop: 12 }}>
+              <div style={subtle}>Your sim evidence</div>
+              <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                <div>
+                  <div style={subtle}>Win Rate</div>
+                  <div style={{ fontWeight: 950 }}>{simStats.winRate.toFixed(0)}%</div>
+                </div>
+                <div>
+                  <div style={subtle}>Expectancy</div>
+                  <div style={{ fontWeight: 950, color: simStats.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
+                    {simStats.expectancyPct >= 0 ? "+" : ""}
+                    {simStats.expectancyPct.toFixed(2)}%
+                  </div>
+                </div>
+                <div>
+                  <div style={subtle}>Payoff</div>
+                  <div style={{ fontWeight: 950 }}>{simStats.payoffRatio >= 10 ? "10+" : simStats.payoffRatio.toFixed(2)}x</div>
+                </div>
+                <div>
+                  <div style={subtle}>Trades</div>
+                  <div style={{ fontWeight: 950 }}>
+                    {simStats.wins}/{simStats.losses}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "0.85fr 1.15fr", gap: 14, marginTop: 14 }}>
+        <div style={panel}>
+          <div style={sectionTitle}>BUY TICKET</div>
+          <div style={{ ...subtle, marginTop: 6 }}>Selected coin and scanner read before you buy.</div>
+
+          <div style={{ ...proPanel, marginTop: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+              <div>
+                <div style={{ fontWeight: 950, fontSize: "1.6rem", color: "#111827" }}>{simSymbol}</div>
+                <div style={{ ...subtle, marginTop: 4 }}>
+                  Price: <b style={{ color: "#111827" }}>{fmtUsd(simulatorPrice)}</b>
+                </div>
+              </div>
+              <ScorePill score={simSelectedSetup?.combinedScore ?? 0} />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
+              <div style={statCard}>
+                <div style={subtle}>Entry</div>
+                <div style={{ fontWeight: 950, color: simSelectedSetup?.entryQuality === "VALID" ? "#047857" : "#111827" }}>
+                  {simSelectedSetup?.entryQuality ?? "LOADING"}
+                </div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Structure</div>
+                <div style={{ fontWeight: 950, color: simSelectedSetup?.structureLabel === "OK" ? "#047857" : "#111827" }}>
+                  {simSelectedSetup?.structureLabel ?? "LOADING"}
+                </div>
+              </div>
+            </div>
+
+            {simSelectedSetup?.structureWhy.length ? <div style={{ ...subtle, marginTop: 10 }}>{simSelectedSetup.structureWhy[0]}</div> : null}
+          </div>
+
+          <div style={{ ...statCard, marginTop: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+              <div>
+                <div style={subtle}>Selected coin</div>
+                <div style={{ fontWeight: 950, fontSize: "1.1rem", color: "#111827" }}>{simSymbol}</div>
+              </div>
+              <button style={btn} onClick={() => setSimCoinSearch("")}>
+                Browse Coins
+              </button>
+            </div>
+            <div style={{ ...subtle, marginTop: 8 }}>Use the scrollable coin list on the right to choose what to buy.</div>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={subtle}>Buy amount (sim USD)</div>
+            <input
+              style={input}
+              inputMode="decimal"
+              value={simBuyUsd}
+              onChange={(e) => setSimBuyUsd(e.target.value)}
+              placeholder="Enter amount, e.g. 250"
+            />
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginTop: 8 }}>
+              {["100", "250", "500", "1000"].map((amount) => (
+                <button key={amount} style={btn} onClick={() => setSimBuyUsd(amount)}>
+                  ${amount}
+                </button>
+              ))}
+            </div>
+            <button
+              style={{ ...(aiTradeBrief.suggestedUsd > 0 ? btn : btnDisabled), width: "100%", marginTop: 8 }}
+              disabled={aiTradeBrief.suggestedUsd <= 0}
+              onClick={() => setSimBuyUsd(String(aiTradeBrief.suggestedUsd))}
+            >
+              Use AI Size ({fmtUsd(aiTradeBrief.suggestedUsd)})
+            </button>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={subtle}>Why are you buying?</div>
+            <input
+              style={input}
+              value={simThesis}
+              onChange={(e) => setSimThesis(e.target.value)}
+              placeholder="e.g. Scanner VALID + Structure OK, quick day-trade test"
+            />
+          </div>
+
+          <button
+            style={{ ...(simCanBuySelected && advancedAi.shouldTrade ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
+            disabled={!simCanBuySelected || !advancedAi.shouldTrade}
+            onClick={() => buySimCrypto(simSymbol)}
+          >
+            {advancedAi.shouldTrade ? `Buy ${simSymbol}` : `AI Caution: Wait on ${simSymbol}`}
+          </button>
+
+          <div style={{ ...subtle, marginTop: 10 }}>
+            {!simCanBuySelected
+              ? "Coins are listed, but this coin needs a live price before buying is enabled. Use Refresh Market or run through localhost:8888."
+              : advancedAi.shouldTrade
+                ? `Buying uses the current market price. Time left: ${simDaysLeft.toFixed(1)} days.`
+                : `AI caution: ${advancedAi.blockers[0] ?? "setup does not have enough estimated edge."}`}
+          </div>
+        </div>
+
+        <div style={panel}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>SCANNER UNIVERSE</div>
+              <div style={{ ...subtle, marginTop: 6 }}>Search or use the best scanner suggestions. Click a coin to load the buy ticket.</div>
+            </div>
+            <input
+              style={{ ...input, maxWidth: 260 }}
+              placeholder="Search coins..."
+              value={simCoinSearch}
+              onChange={(e) => setSimCoinSearch(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10, marginTop: 12, maxHeight: 520, overflow: "auto", paddingRight: 4 }}>
+            {simCoinChoices.map((s) => {
+              const selected = s.symbol === simSymbol;
+              const coinVerdict =
+                s.priceUsd && s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70
+                  ? "AI: Test"
+                  : s.priceUsd
+                    ? "AI: Watch"
+                    : "Loading";
+              return (
+                <div
+                  key={s.symbol}
+                  onClick={() => {
+                    setSimSymbol(s.symbol);
+                    setFocusSymbol(s.symbol);
+                    if (s.priceUsd) {
+                      setEntryPrice(s.priceUsd);
+                      setStopPrice(s.priceUsd * 0.985);
+                    }
+                  }}
+                  style={{
+                    ...statCard,
+                    cursor: "pointer",
+                    border: selected ? "1px solid #0f766e" : statCard.border,
+                    background: selected ? "#eef7f5" : statCard.background,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                    <div style={{ fontWeight: 950 }}>{s.symbol}</div>
+                    <ScorePill score={s.combinedScore} />
+                  </div>
+                  <div style={{ ...subtle, marginTop: 8 }}>
+                    {fmtUsd(s.priceUsd)} · {fmtPct(s.change24h)}
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                    <span style={{ ...pill, borderRadius: 7, color: s.entryQuality === "VALID" ? "#047857" : "#92400e" }}>{s.entryQuality}</span>
+                    <span style={{ ...pill, borderRadius: 7, color: s.structureLabel === "OK" ? "#047857" : "#92400e" }}>{s.structureLabel}</span>
+                    <span style={{ ...pill, borderRadius: 7, color: coinVerdict === "AI: Test" ? "#047857" : "#64748b" }}>{coinVerdict}</span>
+                  </div>
+                  <button
+                    style={{ ...(s.priceUsd ? btn : btnDisabled), marginTop: 10, width: "100%" }}
+                    disabled={!s.priceUsd}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSimSymbol(s.symbol);
+                      setFocusSymbol(s.symbol);
+                      if (s.priceUsd) {
+                        setEntryPrice(s.priceUsd);
+                        setStopPrice(s.priceUsd * 0.985);
+                      }
+                    }}
+                  >
+                    Inspect
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.15fr 0.85fr", gap: 14, marginTop: 14 }}>
+        <div style={panel}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>PORTFOLIO / CURRENT HOLDINGS</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {aiAdvisor
+                  ? `Real AI review: ${aiAdvisor.portfolioReview.summary}`
+                  : `Rule review: ${holdingSummary.headline} · sell ${holdingSummary.sell} · hold ${holdingSummary.hold} · increase ${holdingSummary.increase}`}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button style={aiAdvisorLoading ? btnDisabled : btnDanger} disabled={aiAdvisorLoading} onClick={requestAiAdvisor}>
+                {aiAdvisorLoading ? "Checking..." : aiAdvisor ? "Refresh Real AI" : "Generate Real AI"}
+              </button>
+              <span style={{ ...pill, color: aiAdvisor ? "#047857" : holdingSummary.sell ? "#b91c1c" : holdingSummary.increase ? "#047857" : "#111827" }}>
+                {aiAdvisor ? "REAL AI" : holdingSummary.headline}
+              </span>
+            </div>
+          </div>
+          {aiAdvisorError && (
+            <div style={{ ...statCard, marginTop: 10, borderColor: "#fecaca", background: "#fff1f2" }}>
+              <div style={{ fontWeight: 950, color: "#b91c1c" }}>Real AI needs setup</div>
+              <div style={{ ...subtle, marginTop: 6 }}>{aiAdvisorError}</div>
+            </div>
+          )}
+          <div
+            style={{
+              marginTop: 10,
+              overflowX: "auto",
+              overflowY: "visible",
+              WebkitOverflowScrolling: "touch",
+              paddingBottom: 8,
+            }}
+          >
+            {simState.positions.length === 0 ? (
+              <div style={emptyState}>No simulated crypto bought yet. Pick a coin in the scanner universe, choose a buy amount, then use Buy.</div>
+            ) : (
+              <table style={{ width: "100%", minWidth: 1040, borderCollapse: "separate", borderSpacing: "0 8px" }}>
+                <thead>
+                  <tr style={{ color: "#64748b", fontSize: "0.78rem", textAlign: "left" }}>
+                    <th style={{ paddingLeft: 8 }}>Coin</th>
+                    <th>Buy</th>
+                    <th>Market</th>
+                    <th>Qty</th>
+                    <th>Value</th>
+                    <th>P/L</th>
+                    <th>AI</th>
+                    <th>Scanner</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {simState.positions.map((p) => {
+                    const now = getSimPrice(p.symbol) || p.entry;
+                    const value = now * p.qty;
+                    const pnl = (now - p.entry) * p.qty;
+                    const review = holdingReviews.find((r) => r.id === p.id);
+                    const realAiHolding = aiAdvisor?.portfolioReview.holdings.find((h) => h.symbol.toUpperCase() === p.symbol.toUpperCase());
+                    const realAiTone =
+                      realAiHolding?.action === "SELL" || realAiHolding?.action === "REDUCE" || realAiHolding?.action === "FREE_CAPITAL"
+                        ? "#b91c1c"
+                        : realAiHolding?.action === "INCREASE"
+                          ? "#047857"
+                          : "#111827";
+                    return (
+                      <tr key={p.id} style={{ background: "#f8fafc", verticalAlign: "top" }}>
+                        <td style={{ padding: "10px 8px", fontWeight: 950 }}>{p.symbol}</td>
+                        <td style={{ padding: "10px 8px" }}>{fmtUsd(p.entry)}</td>
+                        <td style={{ padding: "10px 8px" }}>{fmtUsd(now)}</td>
+                        <td style={{ padding: "10px 8px" }}>{p.qty.toFixed(6)}</td>
+                        <td style={{ padding: "10px 8px" }}>{fmtUsd(value)}</td>
+                        <td style={{ padding: "10px 8px", color: pnl >= 0 ? "#047857" : "#b91c1c", fontWeight: 950 }}>{fmtUsd(pnl)}</td>
+                        <td style={{ padding: "10px 8px", minWidth: 210 }}>
+                          {realAiHolding ? (
+                            <div>
+                              <div style={{ fontWeight: 950, color: realAiTone }}>
+                                {realAiHolding.action.replace("_", " ")} · {Math.round(realAiHolding.confidence)}%
+                              </div>
+                              <div style={{ ...subtle, marginTop: 4 }}>{realAiHolding.reason}</div>
+                              <div style={{ ...subtle, marginTop: 4 }}>
+                                {realAiHolding.goalImpact}
+                                {realAiHolding.replacementIdea ? ` Replacement: ${realAiHolding.replacementIdea}` : ""}
+                              </div>
+                            </div>
+                          ) : review ? (
+                            <div>
+                              <div style={{ fontWeight: 950, color: review.tone }}>{review.action}</div>
+                              <div style={{ ...subtle, marginTop: 4 }}>{review.reasons.slice(0, 2).join(" ")}</div>
+                              <div style={{ ...subtle, marginTop: 4 }}>Generate Real AI for capital rotation advice.</div>
+                            </div>
+                          ) : (
+                            <span style={subtle}>Review loading</span>
+                          )}
+                        </td>
+                        <td style={{ padding: "10px 8px", color: "#64748b" }}>{p.source}</td>
+                        <td
+                          style={{
+                            padding: "10px 8px",
+                            textAlign: "right",
+                            minWidth: 170,
+                            position: "sticky",
+                            right: 0,
+                            background: "#f8fafc",
+                            boxShadow: "-14px 0 18px rgba(248,250,252,0.92)",
+                          }}
+                        >
+                          {review?.action === "INCREASE" && (
+                            <button
+                              style={{ ...btn, marginRight: 6, marginBottom: 6 }}
+                              onClick={() => {
+                                setSimSymbol(p.symbol);
+                                setFocusSymbol(p.symbol);
+                                setEntryPrice(now);
+                                setStopPrice(p.stop ?? now * 0.985);
+                                setSimBuyUsd(String(review.addUsd || 50));
+                                setSimThesis(`AI holding review: increase ${p.symbol}. ${review.reasons.join(" ")}`);
+                              }}
+                            >
+                              Add
+                            </button>
+                          )}
+                          {realAiHolding && (realAiHolding.action === "SELL" || realAiHolding.action === "REDUCE" || realAiHolding.action === "FREE_CAPITAL") && (
+                            <button style={{ ...btnDanger, marginRight: 6, marginBottom: 6 }} onClick={() => sellSimHolding(p.id)}>
+                              AI Sell
+                            </button>
+                          )}
+                          <button
+                            style={{ ...btn, marginRight: 6, marginBottom: 6 }}
+                            onClick={() => {
+                              setSimSymbol(p.symbol);
+                              setFocusSymbol(p.symbol);
+                              setEntryPrice(now);
+                              setStopPrice(p.stop ?? now * 0.985);
+                            }}
+                          >
+                            Review
+                          </button>
+                          <button style={btn} onClick={() => sellSimHolding(p.id)}>
+                            Sell
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+
+        <div style={panel}>
+          <div style={sectionTitle}>END RESULT TRACKER</div>
+          <div style={{ ...proPanel, marginTop: 12 }}>
+            <div style={{ fontWeight: 950, color: simReturnPct >= 0 ? "#047857" : "#b91c1c" }}>
+              {simEquity >= simState.startingCashUsd ? "Currently profitable" : "Currently down"}
+            </div>
+            <div style={{ ...subtle, marginTop: 8 }}>
+              Started with {fmtUsd(simState.startingCashUsd)}. Current account value is {fmtUsd(simEquity)}.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, overflow: "auto", maxHeight: 520 }}>
+            {simState.history.length === 0 ? (
+              <div style={emptyState}>Sell a holding to build your buy/sell history and see whether the scanner helped.</div>
+            ) : (
+              simState.history.map((t) => (
+                <div key={t.id} style={{ ...statCard, marginBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <div style={{ fontWeight: 950 }}>Bought and sold {t.symbol}</div>
+                    <div style={{ color: t.pnlUsd >= 0 ? "#047857" : "#b91c1c", fontWeight: 950 }}>
+                      {fmtUsd(t.pnlUsd)} ({t.pnlPct >= 0 ? "+" : ""}
+                      {t.pnlPct.toFixed(2)}%)
+                    </div>
+                  </div>
+                  <div style={{ ...subtle, marginTop: 8 }}>
+                    Buy {fmtUsd(t.entry)} · Sell {fmtUsd(t.exit)} · {new Date(t.closedAtIso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                  <div style={{ ...subtle, marginTop: 8 }}>Scanner tag: {t.source}</div>
+                  {t.thesis && <div style={{ ...subtle, marginTop: 8 }}>{t.thesis}</div>}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  const Accuracy = () => (
+    <>
+      <div style={{ ...panel, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={sectionTitle}>ACCURACY LAB</div>
+            <div style={{ marginTop: 8, fontSize: "1.35rem", fontWeight: 950, color: "#111827" }}>
+              Proof before confidence.
+            </div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              This page scores the scanner from simulator outcomes, replay proxy, AI signal calibration, and current regime. It is evidence, not a guarantee.
+            </div>
+          </div>
+          <span style={{ ...pill, color: accuracyScore.score >= 70 ? "#047857" : accuracyScore.score >= 45 ? "#92400e" : "#b91c1c" }}>
+            Accuracy score: {accuracyScore.score}/100
+          </span>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+          {[
+            ["Evidence weight", `${Math.round(accuracyScore.evidenceWeight * 100)}%`, "More sim trades + AI checks improves trust."],
+            ["Sim score", `${Math.round(accuracyScore.simScore)}/100`, `${simStats.winRate.toFixed(0)}% win · ${simStats.expectancyPct.toFixed(2)}% exp.`],
+            ["Replay score", `${Math.round(accuracyScore.replayScore)}/100`, `${scannerReplay.trades.length} strict replay candidates.`],
+            ["Calibration", `${Math.round(accuracyScore.calibrationScore)}/100`, `${signalCalibration.resolved.length} checked AI signals.`],
+            ["Regime", regimeDiagnostics.label, regimeDiagnostics.action],
+          ].map(([title, value, copy]) => (
+            <div key={title} style={statCard}>
+              <div style={subtle}>{title}</div>
+              <div style={{ marginTop: 6, fontWeight: 950, color: "#111827" }}>{value}</div>
+              <div style={{ ...subtle, marginTop: 8 }}>{copy}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+        <div style={panel}>
+          <div style={sectionTitle}>SCANNER REPLAY PROXY</div>
+          <div style={{ ...subtle, marginTop: 6 }}>
+            Uses current 24h/4h scanner evidence as a quick replay proxy after estimated fees/slippage. Build a deeper candle backtester next.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+            <div style={statCard}><div style={subtle}>Candidates</div><div style={{ fontWeight: 950 }}>{scannerReplay.trades.length}</div></div>
+            <div style={statCard}><div style={subtle}>Win rate</div><div style={{ fontWeight: 950 }}>{scannerReplay.winRate.toFixed(0)}%</div></div>
+            <div style={statCard}><div style={subtle}>Expectancy</div><div style={{ fontWeight: 950, color: scannerReplay.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>{scannerReplay.expectancyPct.toFixed(2)}%</div></div>
+            <div style={statCard}><div style={subtle}>Best / worst</div><div style={{ fontWeight: 950 }}>{scannerReplay.best?.symbol ?? "-"} / {scannerReplay.worst?.symbol ?? "-"}</div></div>
+          </div>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {scannerReplay.trades.slice(0, 8).map((r) => (
+              <div key={r.symbol} style={{ ...statCard, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                <div>
+                  <div style={{ fontWeight: 950 }}>{r.symbol} · score {Math.round(r.score)}</div>
+                  <div style={{ ...subtle, marginTop: 4 }}>Proxy return after costs: {r.afterCostsPct.toFixed(2)}%</div>
+                </div>
+                <span style={{ ...pill, color: r.result >= 0 ? "#047857" : "#b91c1c" }}>{r.result >= 0 ? "PASS" : "FAIL"}</span>
+              </div>
+            ))}
+            {!scannerReplay.trades.length && <div style={emptyState}>No strict replay candidates yet. Refresh market or wait for scanner data.</div>}
+          </div>
+        </div>
+
+        <div style={panel}>
+          <div style={sectionTitle}>AI CONFIDENCE CALIBRATION</div>
+          <div style={{ ...subtle, marginTop: 6 }}>
+            Every generated AI idea is saved locally and checked against later prices. If confidence runs hotter than outcomes, the app automatically reduces confidence.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+            <div style={statCard}><div style={subtle}>Signals</div><div style={{ fontWeight: 950 }}>{signalCalibration.checked.length}</div></div>
+            <div style={statCard}><div style={subtle}>Resolved</div><div style={{ fontWeight: 950 }}>{signalCalibration.resolved.length}</div></div>
+            <div style={statCard}><div style={subtle}>Win rate</div><div style={{ fontWeight: 950 }}>{signalCalibration.winRate.toFixed(0)}%</div></div>
+            <div style={statCard}><div style={subtle}>Adjustment</div><div style={{ fontWeight: 950, color: signalCalibration.adjustment >= 0 ? "#047857" : "#b91c1c" }}>{signalCalibration.adjustment >= 0 ? "+" : ""}{signalCalibration.adjustment.toFixed(0)}</div></div>
+          </div>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {signalCalibration.buckets.map((b) => (
+              <div key={b.floor} style={statCard}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ fontWeight: 950 }}>{b.floor}-{b.floor + 9}% confidence</div>
+                  <div style={{ fontWeight: 950 }}>{b.count ? `${b.winRate.toFixed(0)}% win` : "No data"}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button style={{ ...btn, marginTop: 12 }} onClick={() => setAiSignals([])} disabled={!aiSignals.length}>
+            Clear Signal Log
+          </button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+        <div style={panel}>
+          <div style={sectionTitle}>TRADE GRADES</div>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {tradeGrades.length ? (
+              tradeGrades.map((g) => (
+                <div key={g.id} style={{ ...statCard, display: "grid", gridTemplateColumns: "80px 1fr auto", gap: 10, alignItems: "center" }}>
+                  <div style={{ fontWeight: 950, fontSize: "1.35rem", color: g.grade === "A" || g.grade === "B" ? "#047857" : g.grade === "C" ? "#92400e" : "#b91c1c" }}>{g.grade}</div>
+                  <div>
+                    <div style={{ fontWeight: 950 }}>{g.symbol} · {fmtUsd(g.pnlUsd)} · {g.pnlPct.toFixed(2)}%</div>
+                    <div style={{ ...subtle, marginTop: 4 }}>{g.lesson}</div>
+                  </div>
+                  <span style={pill}>{g.score}/100</span>
+                </div>
+              ))
+            ) : (
+              <div style={emptyState}>Sell simulated holdings to generate trade grades.</div>
+            )}
+          </div>
+        </div>
+
+        <div style={panel}>
+          <div style={sectionTitle}>REGIME + CAPITAL ROTATION</div>
+          <div style={{ ...proPanel, marginTop: 12 }}>
+            <div style={{ fontWeight: 950, color: "#111827" }}>{regimeDiagnostics.label}</div>
+            <div style={{ ...subtle, marginTop: 8 }}>{regimeDiagnostics.action}</div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+            <div style={statCard}><div style={subtle}>Breadth</div><div style={{ fontWeight: 950 }}>{regimeDiagnostics.breadth.toFixed(0)}%</div></div>
+            <div style={statCard}><div style={subtle}>Avg 24h</div><div style={{ fontWeight: 950 }}>{regimeDiagnostics.avgChange.toFixed(2)}%</div></div>
+            <div style={statCard}><div style={subtle}>Avg vol</div><div style={{ fontWeight: 950 }}>{regimeDiagnostics.avgVolFactor.toFixed(2)}x</div></div>
+            <div style={statCard}><div style={subtle}>Strict rate</div><div style={{ fontWeight: 950 }}>{regimeDiagnostics.strictRate.toFixed(1)}%</div></div>
+          </div>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {holdingReviews.length ? (
+              holdingReviews.map((h) => (
+                <div key={h.id} style={statCard}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <div style={{ fontWeight: 950 }}>{h.symbol}</div>
+                    <div style={{ fontWeight: 950, color: h.tone }}>{h.action}</div>
+                  </div>
+                  <div style={{ ...subtle, marginTop: 6 }}>{h.reasons.slice(0, 2).join(" ")}</div>
+                </div>
+              ))
+            ) : (
+              <div style={emptyState}>Buy simulated positions to test capital rotation decisions.</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  const Pro = () => (
+    <>
+      <div style={{ ...panel, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={sectionTitle}>BASIC VS PRO</div>
+            <div style={{ marginTop: 8, fontSize: "1.35rem", fontWeight: 950, color: "#111827" }}>Obsidian Pro adds the intelligence layer.</div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              Basic helps you see the market. Pro helps you decide, practice, review, and package it as a product.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <ProBadge />
+            <button style={btnDanger} onClick={openCheckout}>
+              Buy Pro {PRO_PRICE}
+            </button>
+            {!proPass && (
+              <button style={btn} onClick={activateDemoPass}>
+                Demo Unlock
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+          <div style={statCard}>
+            <div style={{ fontWeight: 950, color: "#0f766e" }}>Basic</div>
+            <div style={{ ...subtle, marginTop: 10, lineHeight: 1.8 }}>
+              Live scanner and watchlist
+              <br />
+              Manual simulator buying and selling
+              <br />
+              Basic score, entry quality, and structure labels
+              <br />
+              Daily commitment and trade journal
+              <br />
+              CSV export
+            </div>
+          </div>
+          <div style={{ ...proPanel }}>
+            <div style={{ fontWeight: 950, color: "#047857" }}>Pro</div>
+            <div style={{ ...subtle, marginTop: 10, lineHeight: 1.8 }}>
+              AI Command Brief with action, confidence, and reasons
+              <br />
+              AI suggested sim sizing
+              <br />
+              Best-candidate and trap-blocker intelligence
+              <br />
+              Weekly simulator review and coaching notes
+              <br />
+              Lead capture and checkout-ready monetization
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+          {[
+            ["AI Confidence", `${aiTradeBrief.confidence}%`, aiTradeBrief.headline],
+            ["Strict Signals", `${watchlistHealth.tradable}`, "VALID + Structure OK + score filter."],
+            ["Trap Blocks", `${watchlistHealth.blocked}`, "Coins that look active but fail timing/structure."],
+            ["Sim Return", `${simReturnPct >= 0 ? "+" : ""}${simReturnPct.toFixed(2)}%`, "Weekly simulated account result."],
+          ].map(([title, value, copy]) => (
+            <div key={title} style={statCard}>
+              <div style={subtle}>{title}</div>
+              <div style={{ marginTop: 6, fontWeight: 950, fontSize: "1.25rem", color: "#111827" }}>{value}</div>
+              <div style={{ ...subtle, marginTop: 8 }}>{copy}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 0.85fr", gap: 14, marginTop: 14 }}>
+        <div style={panel}>
+          <div style={sectionTitle}>PRO PRODUCT ENGINE</div>
+          <div style={{ ...subtle, marginTop: 8 }}>
+            Wire `VITE_CHECKOUT_URL` to Stripe, Gumroad, Whop, or any payment page. The app already has lead capture, pricing, and a Pro state.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}>
+            <div style={statCard}>
+              <div style={{ color: "#0f766e", fontWeight: 900 }}>Customer Promise</div>
+              <div style={{ ...subtle, marginTop: 10, lineHeight: 1.7 }}>
+                Stop guessing. Use a scanner, simulator, AI brief, and journal to prove your process before risking capital.
+              </div>
+            </div>
+            <div style={statCard}>
+              <div style={{ color: "#0f766e", fontWeight: 900 }}>Upsell Path</div>
+              <div style={{ ...subtle, marginTop: 10, lineHeight: 1.7 }}>
+                Pro subscription → weekly review → setup coaching → private alerts/community.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={panel}>
+        <div style={{ color: "#0f766e", fontWeight: 950, letterSpacing: 0.8 }}>CAPTURE A LEAD</div>
+        <div style={{ ...subtle, marginTop: 6 }}>Use this for trial access, coaching calls, or a paid alerts waitlist.</div>
+
+        <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+          <input style={input} placeholder="email@example.com" value={leadEmail} onChange={(e) => setLeadEmail(e.target.value)} />
+          <button style={btn} onClick={saveLead}>
+            Save
+          </button>
+        </div>
+        {leadSaved && <div style={{ marginTop: 10, color: "#047857", fontWeight: 900 }}>Lead saved locally.</div>}
+
+        <div style={{ ...proPanel, marginTop: 14 }}>
+          <div style={{ color: edgeGrade.color, fontWeight: 950 }}>Today’s sales angle: {edgeGrade.label}</div>
+          <div style={{ ...subtle, marginTop: 8 }}>
+            “Obsidian found {watchlistHealth.tradable} strict candidates and blocked {watchlistHealth.blocked} traps. Get the exact trade/no-trade cockpit for {PRO_PRICE}.”
+          </div>
+          <button style={{ ...btnDanger, marginTop: 12 }} onClick={openCheckout}>
+            Send Buyer to Checkout
+          </button>
+        </div>
+
+        <div style={{ marginTop: 14, ...subtle }}>
+          Legal line to keep: this is decision support, not financial advice. The product sells process and risk control, not guaranteed profit.
+        </div>
+      </div>
+      </div>
+    </>
   );
 
   return (
@@ -2062,7 +4596,7 @@ export default function App() {
         <div style={row}>
           <div style={brand}>
             <div style={dot} />
-            <div>OBSIDIAN CRYPTO TRADER</div>
+            <div>OBSIDIAN AI TRADER</div>
           </div>
 
           <div style={tabsWrap}>
@@ -2078,16 +4612,28 @@ export default function App() {
             <div style={tabBtn(tab === "history")} onClick={() => setTab("history")}>
               History
             </div>
+            <div style={tabBtn(tab === "plan")} onClick={() => setTab("plan")}>
+              Plan
+            </div>
+            <div style={tabBtn(tab === "simulator")} onClick={() => setTab("simulator")}>
+              Simulator
+            </div>
+            <div style={tabBtn(tab === "accuracy")} onClick={() => setTab("accuracy")}>
+              Accuracy
+            </div>
+            <div style={tabBtn(tab === "pro")} onClick={() => setTab("pro")}>
+              Pro
+            </div>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <span style={pill}>
-              Local time: <b style={{ color: "#f2e7cd" }}>{localTime}</b>
+              Local time: <b style={{ color: "#111827" }}>{localTime}</b>
             </span>
             <span style={pill}>
-              Focus: <b style={{ color: "#f2e7cd" }}>{focusSymbol}</b>
+              Focus: <b style={{ color: "#111827" }}>{focusSymbol}</b>
             </span>
-            <span style={pill}>{error ? <span style={{ color: "#ffb6b6", fontWeight: 900 }}>Data error</span> : "Live (proxy)"}</span>
+            <span style={pill}>{error ? <span style={{ color: "#b91c1c", fontWeight: 900 }}>Data error</span> : "Live (proxy)"}</span>
           </div>
         </div>
 
@@ -2097,12 +4643,59 @@ export default function App() {
         </div>
       </div>
 
+      <div style={{ ...shell, paddingBottom: 0 }}>
+        <div style={commandHero}>
+          <div style={heroGrid}>
+            <div>
+              <div style={heroKicker}>LIVE SCANNER + 7-DAY SIMULATOR + AI DECISION BRIEF</div>
+              <h1 style={heroTitle}>Trade the scanner before you trade your cash.</h1>
+              <div style={{ color: "#475569", maxWidth: 760, marginTop: 12, lineHeight: 1.55 }}>
+                Buy and sell simulated crypto at live market values, track your portfolio, and use the scanner’s entry,
+                structure, and AI confidence signals to see whether your process could survive a week.
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 16 }}>
+                <button style={btn} onClick={() => setTab("simulator")}>
+                  Open Simulator
+                </button>
+                <button style={btn} onClick={() => setTab("plan")}>
+                  Build Plan
+                </button>
+                <button style={btn} onClick={() => setTab("scanner")}>
+                  Scan Coins
+                </button>
+                <button style={btnDanger} onClick={() => setTab("pro")}>
+                  Basic vs Pro
+                </button>
+                <button style={isLoading ? btnDisabled : btn} onClick={refresh} disabled={isLoading}>
+                  {isLoading ? "Refreshing..." : "Refresh Market"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {[
+                ["AI ADVICE", aiAdvice.symbol, `${aiAdvice.action} · ${aiAdvice.confidence}%`, aiAdvice.action === "BUY TEST" ? "#047857" : aiAdvice.action === "DO NOT BUY" ? "#b91c1c" : "#111827"],
+                ["STRICT SIGNALS", `${watchlistHealth.tradable}`, `${watchlistHealth.blocked} traps blocked`, "#047857"],
+                ["SIM RESULT", `${simReturnPct >= 0 ? "+" : ""}${simReturnPct.toFixed(2)}%`, `${fmtUsd(simEquity)} equity`, simReturnPct >= 0 ? "#047857" : "#b91c1c"],
+                ["PLAN", goalPlan ? goalPlan.strategyProfile : "NO PLAN", goalPlan ? `+${goalPlan.targetReturnPct}%/${goalPlan.targetPeriod} · -${goalPlan.maxDailyLossPct}% stop` : "Accept risk to unlock AI buys", goalPlan ? "#047857" : "#b91c1c"],
+              ].map(([label, value, copy, color]) => (
+                <div key={label} style={heroMetric}>
+                  <div style={{ ...subtle, fontSize: "0.72rem", letterSpacing: 1, fontWeight: 900 }}>{label}</div>
+                  <div style={{ marginTop: 8, color, fontWeight: 950, fontSize: "1.15rem" }}>{value}</div>
+                  <div style={{ ...subtle, marginTop: 6 }}>{copy}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div style={shell}>
-        {commitRequired ? (
+        {commitRequired && tab !== "simulator" && tab !== "plan" && tab !== "accuracy" && tab !== "pro" ? (
           <>
             {commitmentPanel}
             <div style={{ marginTop: 14, ...panel }}>
-              <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>WHY THE APP IS STRICT</div>
+              <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WHY THE APP IS STRICT</div>
               <div style={{ ...subtle, marginTop: 10 }}>
                 A coin can look “strong” on 24h/volume while being untradable after a dump or with no 2R room. Entry Quality + Structure exist to stop chase-trading and protect your capital.
               </div>
@@ -2111,10 +4704,14 @@ export default function App() {
         ) : (
           <>
             {todaysCommitSummary}
-            {tab === "dashboard" && <Dashboard />}
-            {tab === "scanner" && <Scanner />}
-            {tab === "journal" && <Journal />}
-            {tab === "history" && <History />}
+            {tab === "dashboard" && Dashboard()}
+            {tab === "scanner" && Scanner()}
+            {tab === "journal" && Journal()}
+            {tab === "history" && History()}
+            {tab === "plan" && Plan()}
+            {tab === "simulator" && Simulator()}
+            {tab === "accuracy" && Accuracy()}
+            {tab === "pro" && Pro()}
           </>
         )}
       </div>
@@ -2139,7 +4736,7 @@ export default function App() {
             style={{
               width: "min(900px, 96vw)",
               borderRadius: 16,
-              border: "1px solid rgba(255,255,255,0.10)",
+              border: "1px solid #d8e0ea",
               background: "rgba(10,10,10,0.95)",
               padding: 14,
               boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
@@ -2147,7 +4744,7 @@ export default function App() {
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
               <div>
-                <div style={{ color: "#d8c79f", fontWeight: 900, letterSpacing: 0.8 }}>LOG TRADE</div>
+                <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>LOG TRADE</div>
                 <div style={{ ...subtle, marginTop: 4 }}>Success metric: rules followed. Outcome is secondary.</div>
               </div>
               <button style={btn} onClick={() => setLogOpen(false)}>
@@ -2158,7 +4755,7 @@ export default function App() {
             <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
               <div>
                 <div style={subtle}>Side</div>
-                <select style={input} value={logSide} onChange={(e) => setLogSide(e.target.value as any)}>
+                <select style={input} value={logSide} onChange={(e) => setLogSide(e.target.value === "SHORT" ? "SHORT" : "LONG")}>
                   <option value="LONG">LONG</option>
                   <option value="SHORT">SHORT</option>
                 </select>
@@ -2179,7 +4776,7 @@ export default function App() {
 
               <div>
                 <div style={subtle}>Rules followed?</div>
-                <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 6, color: "#bdbdbd", fontWeight: 900 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 6, color: "#64748b", fontWeight: 900 }}>
                   <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
                     <input type="radio" checked={logRulesFollowed} onChange={() => setLogRulesFollowed(true)} />
                     YES
@@ -2202,11 +4799,11 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: 12, background: "rgba(0,0,0,0.20)" }}>
+            <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid #e2e8f0", padding: 12, background: "#f8fafc" }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <div style={{ fontWeight: 900, color: "#f2e7cd" }}>
+                <div style={{ fontWeight: 900, color: "#111827" }}>
                   R Result:{" "}
-                  <span style={{ color: computeR(logSide, logEntry, logStop, logExit) >= 0 ? "#82f0b9" : "#ffb6b6" }}>
+                  <span style={{ color: computeR(logSide, logEntry, logStop, logExit) >= 0 ? "#047857" : "#b91c1c" }}>
                     {fmtR(computeR(logSide, logEntry, logStop, logExit))}
                   </span>
                 </div>
@@ -2224,3 +4821,5 @@ export default function App() {
     </div>
   );
 }
+
+

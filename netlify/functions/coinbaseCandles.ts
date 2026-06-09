@@ -1,6 +1,12 @@
 import type { Handler } from "@netlify/functions";
 
 type Candle1h = { h: number; l: number };
+type CoinbaseCandleRow = [number, number, number, number, number, number];
+type JsonBody = Record<string, unknown>;
+
+function errorMessage(e: unknown) {
+  return e instanceof Error ? e.message : "Unhandled error";
+}
 
 export const handler: Handler = async (event) => {
   try {
@@ -39,7 +45,7 @@ export const handler: Handler = async (event) => {
       });
     }
 
-    const rows = (await res.json()) as any[];
+    const rows = (await res.json()) as CoinbaseCandleRow[];
 
     // Coinbase returns newest-first; normalize oldest-first
     const candles: Candle1h[] = rows
@@ -56,12 +62,12 @@ export const handler: Handler = async (event) => {
     }
 
     return json(200, { symbol: symbolRaw, productId, candles });
-  } catch (e: any) {
-    return json(500, { error: e?.message ?? "Unhandled error" });
+  } catch (e: unknown) {
+    return json(500, { error: errorMessage(e) });
   }
 };
 
-function json(statusCode: number, body: any) {
+function json(statusCode: number, body: JsonBody) {
   return {
     statusCode,
     headers: {

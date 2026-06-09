@@ -1,5 +1,9 @@
 import type { Handler } from "@netlify/functions";
 
+function errorMessage(e: unknown) {
+  return e instanceof Error ? e.message : "Server error";
+}
+
 export const handler: Handler = async (event) => {
   try {
     const id = (event.queryStringParameters?.id || "").trim();
@@ -19,6 +23,12 @@ export const handler: Handler = async (event) => {
     days: "1", // keep 1; if it returns too few points, set to "2"
   }).toString();
 
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "obsidian-terminal/1.0",
+        Accept: "application/json",
+      },
+    });
 
     const text = await res.text();
 
@@ -30,11 +40,11 @@ export const handler: Handler = async (event) => {
       },
       body: text,
     };
-  } catch (e: any) {
+  } catch (e: unknown) {
     return {
       statusCode: 500,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ error: e?.message || "Server error" }),
+      body: JSON.stringify({ error: errorMessage(e) }),
     };
   }
 };

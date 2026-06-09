@@ -1,5 +1,9 @@
 import type { Handler } from "@netlify/functions";
 
+function errorMessage(e: unknown) {
+  return e instanceof Error ? e.message : "Server error";
+}
+
 export const handler: Handler = async (event) => {
   try {
     const ids = event.queryStringParameters?.ids || "";
@@ -29,7 +33,7 @@ export const handler: Handler = async (event) => {
       },
       body,
     };
-  } catch (e: any) {
-    return { statusCode: 500, body: JSON.stringify({ error: e?.message || "Server error" }) };
+  } catch (e: unknown) {
+    return { statusCode: 500, body: JSON.stringify({ error: errorMessage(e) }) };
   }
 };
