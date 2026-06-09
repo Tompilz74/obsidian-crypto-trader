@@ -384,6 +384,13 @@ async function fetchCoinGeckoMarkets(ids: string[]) {
   }>;
 }
 
+async function fetchCoinGeckoMarketsBatched(ids: string[], batchSize = 75) {
+  const batches: string[][] = [];
+  for (let i = 0; i < ids.length; i += batchSize) batches.push(ids.slice(i, i + batchSize));
+  const results = await Promise.all(batches.map((batch) => fetchCoinGeckoMarkets(batch)));
+  return results.flat();
+}
+
 /** Phase 2B: Hourly chart (24h) — via Netlify function proxy */
 async function fetchCoinGeckoHourly24h(coinId: string) {
   const url =
@@ -814,8 +821,10 @@ function evaluateStructure(lastPrice: number, levels: ReturnType<typeof computeP
   return { ok: true, label: "OK", reasons, support, resistance, roomTo2R, source: "BINANCE_1H" };
 }
 
-/** Your Revolut watchlist/movers universe (best-effort CoinGecko ids) */
-const COINS: Array<{ symbol: string; cgId?: string; name?: string }> = [
+type CoinDef = { symbol: string; cgId?: string; name?: string };
+
+/** Original app universe plus a broader Revolut UK candidate universe (best-effort CoinGecko ids). */
+const BASE_COINS: CoinDef[] = [
   { symbol: "BTC", cgId: "bitcoin", name: "Bitcoin" },
   { symbol: "ETH", cgId: "ethereum", name: "Ethereum" },
   { symbol: "SOL", cgId: "solana", name: "Solana" },
@@ -922,6 +931,185 @@ const COINS: Array<{ symbol: string; cgId?: string; name?: string }> = [
   { symbol: "TOKEN", cgId: "tokenfi", name: "TokenFi" },
 ];
 
+const REVOLUT_UK_CANDIDATES: CoinDef[] = [
+  { symbol: "DOGE", cgId: "dogecoin", name: "Dogecoin" },
+  { symbol: "DOT", cgId: "polkadot", name: "Polkadot" },
+  { symbol: "AVAX", cgId: "avalanche-2", name: "Avalanche" },
+  { symbol: "TON", cgId: "the-open-network", name: "Toncoin" },
+  { symbol: "BCH", cgId: "bitcoin-cash", name: "Bitcoin Cash" },
+  { symbol: "LTC", cgId: "litecoin", name: "Litecoin" },
+  { symbol: "NEAR", cgId: "near", name: "NEAR Protocol" },
+  { symbol: "ICP", cgId: "internet-computer", name: "Internet Computer" },
+  { symbol: "APT", cgId: "aptos", name: "Aptos" },
+  { symbol: "ETC", cgId: "ethereum-classic", name: "Ethereum Classic" },
+  { symbol: "RENDER", cgId: "render-token", name: "Render" },
+  { symbol: "VET", cgId: "vechain", name: "VeChain" },
+  { symbol: "FIL", cgId: "filecoin", name: "Filecoin" },
+  { symbol: "ATOM", cgId: "cosmos", name: "Cosmos" },
+  { symbol: "OP", cgId: "optimism", name: "Optimism" },
+  { symbol: "IMX", cgId: "immutable-x", name: "Immutable" },
+  { symbol: "THETA", cgId: "theta-token", name: "Theta Network" },
+  { symbol: "TAO", cgId: "bittensor", name: "Bittensor" },
+  { symbol: "STX", cgId: "blockstack", name: "Stacks" },
+  { symbol: "MNT", cgId: "mantle", name: "Mantle" },
+  { symbol: "ALGO", cgId: "algorand", name: "Algorand" },
+  { symbol: "POL", cgId: "polygon-ecosystem-token", name: "Polygon Ecosystem Token" },
+  { symbol: "AAVE", cgId: "aave", name: "Aave" },
+  { symbol: "FTM", cgId: "fantom", name: "Fantom" },
+  { symbol: "GRT", cgId: "the-graph", name: "The Graph" },
+  { symbol: "JTO", cgId: "jito-governance-token", name: "Jito" },
+  { symbol: "W", cgId: "wormhole", name: "Wormhole" },
+  { symbol: "FLOKI", cgId: "floki", name: "FLOKI" },
+  { symbol: "WLD", cgId: "worldcoin-wld", name: "Worldcoin" },
+  { symbol: "VIRTUAL", cgId: "virtual-protocol", name: "Virtuals Protocol" },
+  { symbol: "RAY", cgId: "raydium", name: "Raydium" },
+  { symbol: "ONDO", cgId: "ondo-finance", name: "Ondo" },
+  { symbol: "GALA", cgId: "gala", name: "Gala" },
+  { symbol: "SAND", cgId: "the-sandbox", name: "The Sandbox" },
+  { symbol: "MANA", cgId: "decentraland", name: "Decentraland" },
+  { symbol: "AXS", cgId: "axie-infinity", name: "Axie Infinity" },
+  { symbol: "BEAM", cgId: "beam-2", name: "Beam" },
+  { symbol: "PENDLE", cgId: "pendle", name: "Pendle" },
+  { symbol: "AERO", cgId: "aerodrome-finance", name: "Aerodrome Finance" },
+  { symbol: "RPL", cgId: "rocket-pool", name: "Rocket Pool" },
+  { symbol: "ENS", cgId: "ethereum-name-service", name: "Ethereum Name Service" },
+  { symbol: "ZEC", cgId: "zcash", name: "Zcash" },
+  { symbol: "XTZ", cgId: "tezos", name: "Tezos" },
+  { symbol: "NEO", cgId: "neo", name: "NEO" },
+  { symbol: "EOS", cgId: "eos", name: "EOS" },
+  { symbol: "IOTA", cgId: "iota", name: "IOTA" },
+  { symbol: "FLOW", cgId: "flow", name: "Flow" },
+  { symbol: "FXS", cgId: "frax-share", name: "Frax Share" },
+  { symbol: "CKB", cgId: "nervos-network", name: "Nervos Network" },
+  { symbol: "HNT", cgId: "helium", name: "Helium" },
+  { symbol: "ZIL", cgId: "zilliqa", name: "Zilliqa" },
+  { symbol: "JST", cgId: "just", name: "JUST" },
+  { symbol: "ZRX", cgId: "0x", name: "0x Protocol" },
+  { symbol: "ANKR", cgId: "ankr", name: "Ankr" },
+  { symbol: "UMA", cgId: "uma", name: "UMA" },
+  { symbol: "SC", cgId: "siacoin", name: "Siacoin" },
+  { symbol: "RVN", cgId: "ravencoin", name: "Ravencoin" },
+  { symbol: "ONT", cgId: "ontology", name: "Ontology" },
+  { symbol: "MASK", cgId: "mask-network", name: "Mask Network" },
+  { symbol: "TRAC", cgId: "origintrail", name: "OriginTrail" },
+  { symbol: "TRB", cgId: "tellor", name: "Tellor" },
+  { symbol: "T", cgId: "threshold-network-token", name: "Threshold" },
+  { symbol: "BAND", cgId: "band-protocol", name: "Band Protocol" },
+  { symbol: "CTSI", cgId: "cartesi", name: "Cartesi" },
+  { symbol: "REQ", cgId: "request-network", name: "Request" },
+  { symbol: "STORJ", cgId: "storj", name: "Storj" },
+  { symbol: "CHR", cgId: "chromaway", name: "Chromia" },
+  { symbol: "SNT", cgId: "status", name: "Status" },
+  { symbol: "POWR", cgId: "power-ledger", name: "Powerledger" },
+  { symbol: "SYN", cgId: "synapse-2", name: "Synapse" },
+  { symbol: "BAL", cgId: "balancer", name: "Balancer" },
+  { symbol: "TIA", cgId: "celestia", name: "Celestia" },
+  { symbol: "MANTA", cgId: "manta-network", name: "Manta Network" },
+  { symbol: "STRK", cgId: "starknet", name: "Starknet" },
+  { symbol: "ZK", cgId: "zksync", name: "ZKsync" },
+  { symbol: "ZRO", cgId: "layerzero", name: "LayerZero" },
+  { symbol: "ETHFI", cgId: "ether-fi", name: "Ether.fi" },
+  { symbol: "ALT", cgId: "altlayer", name: "AltLayer" },
+  { symbol: "AEVO", cgId: "aevo-exchange", name: "Aevo" },
+  { symbol: "SAGA", cgId: "saga-2", name: "Saga" },
+  { symbol: "IO", cgId: "io", name: "io.net" },
+  { symbol: "ZETA", cgId: "zetachain", name: "ZetaChain" },
+  { symbol: "DYM", cgId: "dymension", name: "Dymension" },
+  { symbol: "PIXEL", cgId: "pixels", name: "Pixels" },
+  { symbol: "PORTAL", cgId: "portal-2", name: "Portal" },
+  { symbol: "PEPE", cgId: "pepe", name: "Pepe" },
+  { symbol: "WIF", cgId: "dogwifcoin", name: "dogwifhat" },
+  { symbol: "BRETT", cgId: "brett-2", name: "Brett" },
+  { symbol: "MEW", cgId: "cat-in-a-dogs-world", name: "cat in a dogs world" },
+  { symbol: "BOME", cgId: "book-of-meme", name: "Book of Meme" },
+  { symbol: "POPCAT", cgId: "popcat", name: "Popcat" },
+  { symbol: "TURBO", cgId: "turbo", name: "Turbo" },
+  { symbol: "PNUT", cgId: "peanut-the-squirrel", name: "Peanut the Squirrel" },
+  { symbol: "GOAT", cgId: "goatseus-maximus", name: "Goatseus Maximus" },
+  { symbol: "ORDI", cgId: "ordi", name: "ORDI" },
+  { symbol: "SATS", cgId: "sats-ordinals", name: "SATS" },
+  { symbol: "RUNE", cgId: "thorchain", name: "THORChain" },
+  { symbol: "KAS", cgId: "kaspa", name: "Kaspa" },
+  { symbol: "XMR", cgId: "monero", name: "Monero" },
+  { symbol: "ROSE", cgId: "oasis-network", name: "Oasis Network" },
+  { symbol: "WAXP", cgId: "wax", name: "WAX" },
+  { symbol: "KSM", cgId: "kusama", name: "Kusama" },
+  { symbol: "ONE", cgId: "harmony", name: "Harmony" },
+  { symbol: "QTUM", cgId: "qtum", name: "Qtum" },
+  { symbol: "ICX", cgId: "icon", name: "ICON" },
+  { symbol: "DCR", cgId: "decred", name: "Decred" },
+  { symbol: "ZEN", cgId: "zencash", name: "Horizen" },
+  { symbol: "XEM", cgId: "nem", name: "NEM" },
+  { symbol: "LSK", cgId: "lisk", name: "Lisk" },
+  { symbol: "NANO", cgId: "nano", name: "Nano" },
+  { symbol: "DGB", cgId: "digibyte", name: "DigiByte" },
+  { symbol: "STEEM", cgId: "steem", name: "Steem" },
+  { symbol: "AR", cgId: "arweave", name: "Arweave" },
+  { symbol: "KDA", cgId: "kadena", name: "Kadena" },
+  { symbol: "MINA", cgId: "mina-protocol", name: "Mina" },
+  { symbol: "SSV", cgId: "ssv-network", name: "SSV Network" },
+  { symbol: "LPT", cgId: "livepeer", name: "Livepeer" },
+  { symbol: "AUDIO", cgId: "audius", name: "Audius" },
+  { symbol: "RLC", cgId: "iexec-rlc", name: "iExec RLC" },
+  { symbol: "OXT", cgId: "orchid-protocol", name: "Orchid" },
+  { symbol: "NMR", cgId: "numeraire", name: "Numeraire" },
+  { symbol: "COTI", cgId: "coti", name: "COTI" },
+  { symbol: "DENT", cgId: "dent", name: "Dent" },
+  { symbol: "ARPA", cgId: "arpa", name: "ARPA" },
+  { symbol: "MDT", cgId: "measurable-data-token", name: "Measurable Data Token" },
+  { symbol: "PUNDIX", cgId: "pundi-x-2", name: "Pundi X" },
+  { symbol: "C98", cgId: "coin98", name: "Coin98" },
+  { symbol: "LINA", cgId: "linear", name: "Linear" },
+  { symbol: "ALPHA", cgId: "alpha-finance", name: "Stella" },
+  { symbol: "REEF", cgId: "reef", name: "Reef" },
+  { symbol: "DODO", cgId: "dodo", name: "DODO" },
+  { symbol: "BAKE", cgId: "bakerytoken", name: "BakerySwap" },
+  { symbol: "CAKE", cgId: "pancakeswap-token", name: "PancakeSwap" },
+  { symbol: "GMX", cgId: "gmx", name: "GMX" },
+  { symbol: "SNX", cgId: "havven", name: "Synthetix" },
+  { symbol: "KSM", cgId: "kusama", name: "Kusama" },
+  { symbol: "LUNC", cgId: "terra-luna", name: "Terra Classic" },
+  { symbol: "LUNA", cgId: "terra-luna-2", name: "Terra" },
+  { symbol: "OSMO", cgId: "osmosis", name: "Osmosis" },
+  { symbol: "XEC", cgId: "ecash", name: "eCash" },
+  { symbol: "CFX", cgId: "conflux-token", name: "Conflux" },
+  { symbol: "KLAY", cgId: "klay-token", name: "Kaia" },
+  { symbol: "GNO", cgId: "gnosis", name: "Gnosis" },
+  { symbol: "SAFE", cgId: "safe", name: "Safe" },
+  { symbol: "CSPR", cgId: "casper-network", name: "Casper" },
+  { symbol: "WEMIX", cgId: "wemix-token", name: "WEMIX" },
+  { symbol: "XDC", cgId: "xdce-crowd-sale", name: "XDC Network" },
+  { symbol: "ELF", cgId: "aelf", name: "aelf" },
+  { symbol: "GAS", cgId: "gas", name: "Gas" },
+  { symbol: "VTHO", cgId: "vethor-token", name: "VeThor" },
+  { symbol: "SXP", cgId: "swipe", name: "Solar" },
+  { symbol: "WIN", cgId: "wink", name: "WINkLink" },
+  { symbol: "SUN", cgId: "sun-token", name: "Sun" },
+  { symbol: "BTT", cgId: "bittorrent", name: "BitTorrent" },
+  { symbol: "GMT", cgId: "stepn", name: "STEPN" },
+  { symbol: "ACH", cgId: "alchemy-pay", name: "Alchemy Pay" },
+  { symbol: "CELR", cgId: "celer-network", name: "Celer Network" },
+  { symbol: "CRO", cgId: "crypto-com-chain", name: "Cronos" },
+  { symbol: "OKB", cgId: "okb", name: "OKB" },
+  { symbol: "BGB", cgId: "bitget-token", name: "Bitget Token" },
+  { symbol: "GT", cgId: "gatechain-token", name: "GateToken" },
+  { symbol: "LEO", cgId: "leo-token", name: "UNUS SED LEO" },
+  { symbol: "USDT", cgId: "tether", name: "Tether" },
+  { symbol: "DAI", cgId: "dai", name: "Dai" },
+  { symbol: "FDUSD", cgId: "first-digital-usd", name: "First Digital USD" },
+  { symbol: "PYUSD", cgId: "paypal-usd", name: "PayPal USD" },
+];
+
+const COINS: CoinDef[] = Array.from(
+  [...BASE_COINS, ...REVOLUT_UK_CANDIDATES]
+    .reduce((acc, coin) => {
+      const key = coin.symbol.toUpperCase();
+      if (!acc.has(key)) acc.set(key, { ...coin, symbol: key });
+      return acc;
+    }, new Map<string, CoinDef>())
+    .values()
+);
+
 export default function App() {
   const [tab, setTab] = useState<TabKey>("dashboard");
   const [query, setQuery] = useState("");
@@ -1010,7 +1198,7 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const rows = await fetchCoinGeckoMarkets(coinIds);
+      const rows = await fetchCoinGeckoMarketsBatched(coinIds);
       const byId = new Map(rows.map((r) => [r.id, r]));
 
       const merged: MarketRow[] = COINS.map((c) => {
@@ -1210,6 +1398,11 @@ export default function App() {
           })),
     [market]
   );
+  const universeStats = useMemo(() => {
+    const live = marketUniverse.filter((m) => typeof m.priceUsd === "number" && isFinite(m.priceUsd)).length;
+    const missing = Math.max(0, COINS.length - live);
+    return { total: COINS.length, live, missing };
+  }, [marketUniverse]);
 
   const filteredMarket = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -2844,8 +3037,13 @@ export default function App() {
       <div style={grid2}>
         <div style={panel}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-            <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
-            <span style={pill}>Revolut universe</span>
+            <div>
+              <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
+              <div style={{ ...subtle, marginTop: 4 }}>
+                Revolut UK candidate universe: {universeStats.total} coins · live data {universeStats.live} · missing {universeStats.missing}
+              </div>
+            </div>
+            <span style={pill}>UK universe</span>
           </div>
 
           <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -4070,7 +4268,9 @@ export default function App() {
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <div>
               <div style={sectionTitle}>SCANNER UNIVERSE</div>
-              <div style={{ ...subtle, marginTop: 6 }}>Search or use the best scanner suggestions. Click a coin to load the buy ticket.</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                Revolut UK candidate universe: {universeStats.total} coins. Live data loaded for {universeStats.live}; missing entries stay visible for cleanup.
+              </div>
             </div>
             <input
               style={{ ...input, maxWidth: 260 }}
