@@ -260,6 +260,10 @@ const fmtUsd = (n?: number) =>
 const fmtPct = (n?: number) => (typeof n === "number" && isFinite(n) ? `${n.toFixed(2)}%` : "—");
 const fmtR = (r?: number) =>
   typeof r === "number" && isFinite(r) ? `${r >= 0 ? "+" : ""}${r.toFixed(2)}R` : "—";
+const confidencePct = (n?: number) => {
+  if (typeof n !== "number" || !isFinite(n)) return 0;
+  return Math.round(clamp(n <= 1 ? n * 100 : n, 0, 100));
+};
 
 function useInterval(callback: () => void, delayMs: number | null) {
   const savedRef = useRef(callback);
@@ -1820,7 +1824,7 @@ export default function App() {
               tsIso: new Date().toISOString(),
               symbol: idea.symbol.toUpperCase(),
               action: idea.action,
-              confidence: idea.confidence,
+              confidence: confidencePct(idea.confidence),
               entry: getSimPrice(idea.symbol.toUpperCase()) || setup?.priceUsd || 0,
               score: setup?.combinedScore ?? 0,
               verdict: "OPEN" as const,
@@ -3730,7 +3734,7 @@ export default function App() {
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                             <div>
                               <div style={{ fontWeight: 950, color: idea.action === "BUY_TEST" ? "#047857" : idea.action === "AVOID" || idea.action === "SELL" ? "#b91c1c" : "#111827" }}>
-                                {idea.action.replace("_", " ")} {idea.symbol} · {Math.round(idea.confidence)}%
+                                {idea.action.replace("_", " ")} {idea.symbol} · {confidencePct(idea.confidence)}%
                               </div>
                               <div style={{ ...subtle, marginTop: 6 }}>{idea.thesis}</div>
                             </div>
@@ -4214,7 +4218,7 @@ export default function App() {
                           {realAiHolding ? (
                             <div>
                               <div style={{ fontWeight: 950, color: realAiTone }}>
-                                {realAiHolding.action.replace("_", " ")} · {Math.round(realAiHolding.confidence)}%
+                                {realAiHolding.action.replace("_", " ")} · {confidencePct(realAiHolding.confidence)}%
                               </div>
                               <div style={{ ...subtle, marginTop: 4 }}>{realAiHolding.reason}</div>
                               <div style={{ ...subtle, marginTop: 4 }}>

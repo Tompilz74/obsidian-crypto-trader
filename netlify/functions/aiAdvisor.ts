@@ -80,7 +80,7 @@ const advisorSchema = {
         properties: {
           symbol: { type: "string" },
           action: { type: "string", enum: ["BUY_TEST", "WATCH", "HOLD", "SELL", "AVOID"] },
-          confidence: { type: "number" },
+          confidence: { type: "number", minimum: 0, maximum: 100 },
           thesis: { type: "string" },
           planFit: { type: "string" },
           entryZone: { type: "string" },
@@ -121,7 +121,7 @@ const advisorSchema = {
             properties: {
               symbol: { type: "string" },
               action: { type: "string", enum: ["SELL", "HOLD", "REDUCE", "INCREASE", "FREE_CAPITAL"] },
-              confidence: { type: "number" },
+              confidence: { type: "number", minimum: 0, maximum: 100 },
               reason: { type: "string" },
               goalImpact: { type: "string" },
               replacementIdea: { type: "string" },
@@ -183,6 +183,7 @@ export const handler = async (event: FunctionEvent) => {
       "Include source URLs for any news/event catalysts.",
       "For every open holding, include a portfolioReview.holdings item deciding SELL, HOLD, REDUCE, INCREASE, or FREE_CAPITAL.",
       "When recommending SELL/FREE_CAPITAL, name what stronger setup or goal constraint justifies freeing capital.",
+      "All confidence fields must be whole-number percentages from 0 to 100, never decimals from 0 to 1.",
       "Return concise structured guidance for a simulator-first trader. Keep every string short.",
       JSON.stringify(compact, null, 2),
     ].join("\n\n");
