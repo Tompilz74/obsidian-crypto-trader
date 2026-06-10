@@ -22,6 +22,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 type TabKey = "dashboard" | "scanner" | "journal" | "history" | "plan" | "simulator" | "accuracy" | "pro";
 type SessionStatus = "TRADE" | "SELECTIVE" | "WAIT";
 type TradeSide = "LONG" | "SHORT";
+type SimTradeMode = "NORMAL" | "SCALP";
 
 type MarketRow = {
   symbol: string;
@@ -108,6 +109,7 @@ type SimPosition = {
   openedAtIso: string;
   symbol: string;
   side: TradeSide;
+  mode?: SimTradeMode;
   entry: number;
   qty: number;
   notionalUsd: number;
@@ -224,6 +226,21 @@ type AiSignalRecord = {
   verdict?: "WIN" | "LOSS" | "OPEN";
   checkedAtIso?: string;
   resultPct?: number;
+};
+
+type ScalpSignal = {
+  symbol: string;
+  price: number;
+  burstScore: number;
+  action: "SCALP_TEST" | "WATCH" | "TOO_LATE" | "NO_LIQUIDITY";
+  tone: string;
+  stop: number;
+  target: number;
+  holdWindow: string;
+  suggestedUsd: number;
+  reasons: string[];
+  warnings: string[];
+  setup: SetupRow;
 };
 
 type MicroMetrics = {
@@ -1155,6 +1172,7 @@ export default function App() {
   const [goalPlanInputText, setGoalPlanInputText] = useState<Record<GoalPlanNumberKey, string>>(() => goalPlanNumberText(goalPlanDraft));
   const [goalRiskAccepted, setGoalRiskAccepted] = useState(false);
   const [simSymbol, setSimSymbol] = useState("SOL");
+  const [simTradeMode, setSimTradeMode] = useState<SimTradeMode>("NORMAL");
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simBuyUsd, setSimBuyUsd] = useState("250");
   const [simStopLossInput, setSimStopLossInput] = useState("");
@@ -1524,6 +1542,45 @@ export default function App() {
   const simPlannedLossPct = simStopLossValid ? ((simulatorPrice - simStopLoss) / simulatorPrice) * 100 : 0;
   const simPlannedGainPct = simTakeProfitValid ? ((simTakeProfit - simulatorPrice) / simulatorPrice) * 100 : 0;
   const simRewardRisk = simPlannedLossPct > 0 && simPlannedGainPct > 0 ? simPlannedGainPct / simPlannedLossPct : 0;
+  const scalpSignals = useMemo<ScalpSignal[]>(() => {
+    return setups
+      .map((s) => {
+        const price = getSimPrice(s.symbol) || s.priceUsd || 0;
+        const ch24 = s.change24h ?? 0;
+        const fastMove = typeof s.ret1h === "number" ? s.ret1h : ch24 * 0.16;
+        const volumeScore = clamp(Math.log10(Math.max(1, s.volFactor)) * 36 + 42, 0, 100);
+        const momentumScore = clamp(48 + fastMove * 12 + Math.max(0, ch24) * 2.2, 0, 100);
+        const liquidityOk = s.volFactor >= 1.15 && price > 0;
+        const tooLate = ch24 >= 18 || fastMove >= 5 || (s.spikeFromLow6h ?? 0) >= 9;
+        const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || ch24 <= -4;
+        const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
+        const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.42 - (tooLate ? 22 : 0) - (dumpRisk ? 18 : 0) - structurePenalty, 0, 100));
+        const stopPct = clamp(Math.max(0.55, Math.min(1.9, Math.abs(fastMove) * 0.22 + Math.abs(ch24) * 0.035)), 0.55, 1.9);
+        const targetPct = clamp(stopPct * (tooLate ? 1.15 : 1.7), 0.9, 3.2);
+        const stop = price ? price * (1 - stopPct / 100) : 0;
+        const target = price ? price * (1 + targetPct / 100) : 0;
+        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 72 && fastMove > 0.25 ? "SCALP_TEST" : burstScore >= 58 ? "WATCH" : "NO_LIQUIDITY";
+        const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
+        const holdWindow = action === "SCALP_TEST" ? "5 to 45 minutes, exit at stop/target or if momentum fades." : "Wait for a cleaner burst; do not force entry.";
+        const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * 0.08), 150)) : 0;
+        const reasons = [
+          `Burst score ${burstScore}/100`,
+          `Fast move proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
+          `Volume ${s.volFactor.toFixed(2)}x baseline`,
+        ];
+        const warnings: string[] = [];
+        if (tooLate) warnings.push("Move looks extended; likely late chase risk.");
+        if (dumpRisk) warnings.push("Recent pullback/dump risk is active.");
+        if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
+        if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
+        return { symbol: s.symbol, price, burstScore, action, tone, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
+      })
+      .filter((s) => s.price > 0)
+      .sort((a, b) => b.burstScore - a.burstScore)
+      .slice(0, 12);
+  }, [getSimPrice, setups, simState.cashUsd]);
+  const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
+  const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
     const base = setups.length ? setups : COINS.map((c) => ({
@@ -1567,6 +1624,14 @@ export default function App() {
     const expectancyPct = simState.history.length ? simState.history.reduce((acc, t) => acc + t.pnlPct, 0) / simState.history.length : 0;
     const payoffRatio = avgLossPct > 0 ? avgWinPct / avgLossPct : avgWinPct > 0 ? 99 : 0;
     return { wins: wins.length, losses: losses.length, winRate, avgWinPct, avgLossPct, expectancyPct, payoffRatio };
+  }, [simState.history]);
+  const simScalpStats = useMemo(() => {
+    const trades = simState.history.filter((t) => t.mode === "SCALP" || t.source.startsWith("SCALP"));
+    const wins = trades.filter((t) => t.pnlUsd > 0).length;
+    const pnlUsd = trades.reduce((acc, t) => acc + t.pnlUsd, 0);
+    const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+    const expectancyPct = trades.length ? trades.reduce((acc, t) => acc + t.pnlPct, 0) / trades.length : 0;
+    return { trades: trades.length, wins, pnlUsd, winRate, expectancyPct };
   }, [simState.history]);
 
   useEffect(() => {
@@ -1810,6 +1875,15 @@ export default function App() {
     const suggestedUsd = advancedAi.shouldTrade ? Math.max(25, Math.min(simState.cashUsd, advancedAi.maxTradeUsd)) : 0;
     return { action, confidence, headline, reasons, suggestedUsd, tone };
   }, [advancedAi, simCanBuySelected, simSelectedHolding, simSelectedSetup, simState.cashUsd, simSymbol]);
+  const simBuyAllowed =
+    simCanBuySelected &&
+    simStopLossValid &&
+    simTakeProfitValid &&
+    (simTradeMode === "SCALP" ? scalpModeCanBuy : advancedAi.shouldTrade);
+  const simBuyBlocker =
+    simTradeMode === "SCALP"
+      ? selectedScalpSignal?.warnings[0] ?? "Quick scalp needs a SCALP TEST signal."
+      : advancedAi.blockers[0] ?? "setup does not have enough estimated edge.";
 
   const aiAdvice = useMemo(() => {
     const candidate =
@@ -2126,6 +2200,14 @@ export default function App() {
       alert("Set a stop loss below the current price and a take profit above the current price before buying.");
       return;
     }
+    if (simTradeMode === "NORMAL" && !advancedAi.shouldTrade) {
+      alert("Normal scanner AI says wait on this coin.");
+      return;
+    }
+    if (simTradeMode === "SCALP" && selectedScalpSignal?.action !== "SCALP_TEST") {
+      alert("Quick Scalp mode only allows buys when the burst scanner says SCALP TEST.");
+      return;
+    }
 
     const setup = setups.find((s) => s.symbol === symbol);
     const position: SimPosition = {
@@ -2133,13 +2215,19 @@ export default function App() {
       openedAtIso: new Date().toISOString(),
       symbol,
       side: "LONG",
+      mode: simTradeMode,
       entry: price,
       qty: notional / price,
       notionalUsd: notional,
       stop: simStopLossValid ? simStopLoss : undefined,
       takeProfit: simTakeProfitValid ? simTakeProfit : undefined,
       thesis: simThesis.trim() || undefined,
-      source: setup ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}` : edgeGrade.label,
+      source:
+        simTradeMode === "SCALP" && selectedScalpSignal
+          ? `SCALP / ${selectedScalpSignal.action} / ${selectedScalpSignal.burstScore}`
+          : setup
+            ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}`
+            : edgeGrade.label,
     };
     setSimState((s) => ({ ...s, cashUsd: s.cashUsd - notional, positions: [position, ...s.positions] }));
     setSimSymbol(symbol);
@@ -4259,10 +4347,117 @@ export default function App() {
         </div>
       </div>
 
+      <div style={{ ...panel, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={sectionTitle}>QUICK SCALP / MOMENTUM BURST</div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              Fast-move simulator mode for short holds only. It looks for momentum plus volume, then blocks late chases.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button style={simTradeMode === "NORMAL" ? btnDanger : btn} onClick={() => setSimTradeMode("NORMAL")}>
+              Normal Scanner
+            </button>
+            <button style={simTradeMode === "SCALP" ? btnDanger : btn} onClick={() => setSimTradeMode("SCALP")}>
+              Quick Scalp
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(220px, 1fr))", gap: 10, marginTop: 12, overflowX: "auto", paddingBottom: 4 }}>
+          {scalpSignals.length === 0 ? (
+            <div style={{ ...emptyState, gridColumn: "1 / -1" }}>No burst candidates loaded yet. Refresh Market to scan the universe.</div>
+          ) : (
+            scalpSignals.slice(0, 8).map((signal) => (
+              <div
+                key={signal.symbol}
+                style={{
+                  ...statCard,
+                  background: signal.symbol === simSymbol && simTradeMode === "SCALP" ? "#eef7f5" : "#ffffff",
+                  borderColor: signal.symbol === simSymbol && simTradeMode === "SCALP" ? "#0f766e" : "#e2e8f0",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontWeight: 950, color: "#111827" }}>{signal.symbol}</div>
+                    <div style={{ ...subtle, marginTop: 4 }}>{fmtUsd(signal.price)}</div>
+                  </div>
+                  <span style={{ ...pill, color: signal.tone }}>{signal.burstScore}/100</span>
+                </div>
+                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")}</div>
+                <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
+                {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={subtle}>Stop</div>
+                    <div style={{ fontWeight: 900, color: "#b91c1c" }}>{fmtUsd(signal.stop)}</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Target</div>
+                    <div style={{ fontWeight: 900, color: "#047857" }}>{fmtUsd(signal.target)}</div>
+                  </div>
+                </div>
+                <button
+                  style={{ ...(signal.action === "SCALP_TEST" ? btnDanger : btn), width: "100%", marginTop: 10 }}
+                  onClick={() => {
+                    setSimTradeMode("SCALP");
+                    setSimSymbol(signal.symbol);
+                    setFocusSymbol(signal.symbol);
+                    setEntryPrice(signal.price);
+                    setStopPrice(signal.stop);
+                    setSimStopLossInput(signal.stop.toPrecision(8));
+                    setSimTakeProfitInput(signal.target.toPrecision(8));
+                    setSimBuyUsd(String(signal.suggestedUsd || 50));
+                    setSimThesis(`Quick scalp: ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
+                  }}
+                >
+                  Load Scalp Ticket
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
+          <div style={statCard}>
+            <div style={subtle}>Scalp trades</div>
+            <div style={{ fontWeight: 950 }}>{simScalpStats.trades}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Scalp win rate</div>
+            <div style={{ fontWeight: 950 }}>{simScalpStats.trades ? `${simScalpStats.winRate.toFixed(0)}%` : "No data"}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Scalp P/L</div>
+            <div style={{ fontWeight: 950, color: simScalpStats.pnlUsd >= 0 ? "#047857" : "#b91c1c" }}>{fmtUsd(simScalpStats.pnlUsd)}</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Scalp expectancy</div>
+            <div style={{ fontWeight: 950, color: simScalpStats.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
+              {simScalpStats.trades ? `${simScalpStats.expectancyPct >= 0 ? "+" : ""}${simScalpStats.expectancyPct.toFixed(2)}%` : "No data"}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ ...subtle, marginTop: 10 }}>
+          Scalp rules: smaller size, mandatory stop, mandatory target, and exit fast. If the card says TOO LATE, the simulator treats it as a chase and blocks the buy.
+        </div>
+      </div>
+
       <div style={{ display: "grid", gridTemplateColumns: "0.85fr 1.15fr", gap: 14, marginTop: 14 }}>
         <div style={panel}>
-          <div style={sectionTitle}>BUY TICKET</div>
-          <div style={{ ...subtle, marginTop: 6 }}>Selected coin and scanner read before you buy.</div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>BUY TICKET</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {simTradeMode === "SCALP" ? "Quick scalp ticket: small size, fast exit, no late chases." : "Selected coin and scanner read before you buy."}
+              </div>
+            </div>
+            <span style={{ ...pill, color: simTradeMode === "SCALP" ? "#b91c1c" : "#047857" }}>
+              {simTradeMode === "SCALP" ? "QUICK SCALP" : "NORMAL"}
+            </span>
+          </div>
 
           <div style={{ ...proPanel, marginTop: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
@@ -4291,6 +4486,14 @@ export default function App() {
             </div>
 
             {simSelectedSetup?.structureWhy.length ? <div style={{ ...subtle, marginTop: 10 }}>{simSelectedSetup.structureWhy[0]}</div> : null}
+            {simTradeMode === "SCALP" && selectedScalpSignal && (
+              <div style={{ ...statCard, marginTop: 10, background: "#ffffff", borderColor: selectedScalpSignal.action === "SCALP_TEST" ? "#99f6e4" : "#fed7aa" }}>
+                <div style={{ fontWeight: 950, color: selectedScalpSignal.tone }}>
+                  Burst: {selectedScalpSignal.action.replace("_", " ")} · {selectedScalpSignal.burstScore}/100
+                </div>
+                <div style={{ ...subtle, marginTop: 6 }}>{selectedScalpSignal.holdWindow}</div>
+              </div>
+            )}
           </div>
 
           <div style={{ ...statCard, marginTop: 12 }}>
@@ -4323,11 +4526,11 @@ export default function App() {
               ))}
             </div>
             <button
-              style={{ ...(aiTradeBrief.suggestedUsd > 0 ? btn : btnDisabled), width: "100%", marginTop: 8 }}
-              disabled={aiTradeBrief.suggestedUsd <= 0}
-              onClick={() => setSimBuyUsd(String(aiTradeBrief.suggestedUsd))}
+              style={{ ...((simTradeMode === "SCALP" ? (selectedScalpSignal?.suggestedUsd ?? 0) : aiTradeBrief.suggestedUsd) > 0 ? btn : btnDisabled), width: "100%", marginTop: 8 }}
+              disabled={(simTradeMode === "SCALP" ? (selectedScalpSignal?.suggestedUsd ?? 0) : aiTradeBrief.suggestedUsd) <= 0}
+              onClick={() => setSimBuyUsd(String(simTradeMode === "SCALP" ? selectedScalpSignal?.suggestedUsd ?? 0 : aiTradeBrief.suggestedUsd))}
             >
-              Use AI Size ({fmtUsd(aiTradeBrief.suggestedUsd)})
+              Use {simTradeMode === "SCALP" ? "Scalp" : "AI"} Size ({fmtUsd(simTradeMode === "SCALP" ? selectedScalpSignal?.suggestedUsd ?? 0 : aiTradeBrief.suggestedUsd)})
             </button>
           </div>
 
@@ -4398,19 +4601,19 @@ export default function App() {
           </div>
 
           <button
-            style={{ ...(simCanBuySelected && advancedAi.shouldTrade && simStopLossValid && simTakeProfitValid ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
-            disabled={!simCanBuySelected || !advancedAi.shouldTrade || !simStopLossValid || !simTakeProfitValid}
+            style={{ ...(simBuyAllowed ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
+            disabled={!simBuyAllowed}
             onClick={() => buySimCrypto(simSymbol)}
           >
-            {advancedAi.shouldTrade ? `Buy ${simSymbol}` : `AI Caution: Wait on ${simSymbol}`}
+            {simBuyAllowed ? `Buy ${simSymbol}` : simTradeMode === "SCALP" ? `Scalp Caution: Wait on ${simSymbol}` : `AI Caution: Wait on ${simSymbol}`}
           </button>
 
           <div style={{ ...subtle, marginTop: 10 }}>
             {!simCanBuySelected
               ? "Coins are listed, but this coin needs a live price before buying is enabled. Use Refresh Market or run through localhost:8888."
-              : advancedAi.shouldTrade
+              : simBuyAllowed
                 ? `Buying uses the current market price. Time left: ${simDaysLeft.toFixed(1)} days.`
-                : `AI caution: ${advancedAi.blockers[0] ?? "setup does not have enough estimated edge."}`}
+                : `${simTradeMode === "SCALP" ? "Scalp caution" : "AI caution"}: ${simBuyBlocker}`}
           </div>
         </div>
 
@@ -4566,7 +4769,10 @@ export default function App() {
                           : "#111827";
                     return (
                       <tr key={p.id} style={{ background: "#f8fafc", verticalAlign: "top" }}>
-                        <td style={{ padding: "10px 8px", fontWeight: 950 }}>{p.symbol}</td>
+                        <td style={{ padding: "10px 8px", fontWeight: 950 }}>
+                          {p.symbol}
+                          {p.mode === "SCALP" && <div style={{ ...pill, marginTop: 6, display: "inline-block", color: "#b91c1c" }}>SCALP</div>}
+                        </td>
                         <td style={{ padding: "10px 8px" }}>{fmtUsd(p.entry)}</td>
                         <td style={{ padding: "10px 8px" }}>{fmtUsd(now)}</td>
                         <td style={{ padding: "10px 8px" }}>{p.qty.toFixed(6)}</td>
@@ -4700,6 +4906,9 @@ export default function App() {
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                     <div style={{ fontWeight: 950 }}>
                       Bought and sold {t.symbol}
+                      {(t.mode === "SCALP" || t.source.startsWith("SCALP")) && (
+                        <span style={{ ...pill, marginLeft: 8, color: "#b91c1c" }}>SCALP</span>
+                      )}
                       {t.exitReason && (
                         <span style={{ ...pill, marginLeft: 8, color: t.exitReason === "TAKE_PROFIT" ? "#047857" : t.exitReason === "STOP_LOSS" ? "#b91c1c" : "#111827" }}>
                           {t.exitReason.replace("_", " ")}
