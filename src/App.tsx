@@ -122,6 +122,7 @@ type SimClosedTrade = SimPosition & {
   exit: number;
   pnlUsd: number;
   pnlPct: number;
+  exitReason?: "MANUAL" | "STOP_LOSS" | "TAKE_PROFIT";
 };
 
 type SimState = {
@@ -1156,6 +1157,8 @@ export default function App() {
   const [simSymbol, setSimSymbol] = useState("SOL");
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simBuyUsd, setSimBuyUsd] = useState("250");
+  const [simStopLossInput, setSimStopLossInput] = useState("");
+  const [simTakeProfitInput, setSimTakeProfitInput] = useState("");
   const [simThesis, setSimThesis] = useState("");
 
   // Trade logging modal state
@@ -1514,6 +1517,13 @@ export default function App() {
   const simSelectedSetup = setups.find((s) => s.symbol === simSymbol);
   const simulatorPrice = getSimPrice(simSymbol) || simSelectedSetup?.priceUsd || 0;
   const simCanBuySelected = simulatorPrice > 0 && isFinite(simulatorPrice);
+  const simStopLoss = Number(simStopLossInput);
+  const simTakeProfit = Number(simTakeProfitInput);
+  const simStopLossValid = simCanBuySelected && Number.isFinite(simStopLoss) && simStopLoss > 0 && simStopLoss < simulatorPrice;
+  const simTakeProfitValid = simCanBuySelected && Number.isFinite(simTakeProfit) && simTakeProfit > simulatorPrice;
+  const simPlannedLossPct = simStopLossValid ? ((simulatorPrice - simStopLoss) / simulatorPrice) * 100 : 0;
+  const simPlannedGainPct = simTakeProfitValid ? ((simTakeProfit - simulatorPrice) / simulatorPrice) * 100 : 0;
+  const simRewardRisk = simPlannedLossPct > 0 && simPlannedGainPct > 0 ? simPlannedGainPct / simPlannedLossPct : 0;
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
     const base = setups.length ? setups : COINS.map((c) => ({
@@ -1558,6 +1568,53 @@ export default function App() {
     const payoffRatio = avgLossPct > 0 ? avgWinPct / avgLossPct : avgWinPct > 0 ? 99 : 0;
     return { wins: wins.length, losses: losses.length, winRate, avgWinPct, avgLossPct, expectancyPct, payoffRatio };
   }, [simState.history]);
+
+  useEffect(() => {
+    if (!simCanBuySelected || !simulatorPrice) return;
+    const setupStop = simSelectedSetup?.support && simSelectedSetup.support < simulatorPrice ? simSelectedSetup.support : simulatorPrice * 0.985;
+    const risk = Math.max(simulatorPrice - setupStop, simulatorPrice * 0.008);
+    setSimStopLossInput((v) => (v.trim() ? v : setupStop.toPrecision(8)));
+    setSimTakeProfitInput((v) => (v.trim() ? v : (simulatorPrice + risk * 2).toPrecision(8)));
+  }, [simCanBuySelected, simSelectedSetup?.support, simSymbol, simulatorPrice]);
+
+  useEffect(() => {
+    setSimState((s) => {
+      const closedAtIso = new Date().toISOString();
+      const closed: SimClosedTrade[] = [];
+      const positions: SimPosition[] = [];
+      let cashToReturn = 0;
+
+      for (const position of s.positions) {
+        const price = getSimPrice(position.symbol);
+        const hitStop = typeof position.stop === "number" && price > 0 && price <= position.stop;
+        const hitTarget = typeof position.takeProfit === "number" && price > 0 && price >= position.takeProfit;
+
+        if (!hitStop && !hitTarget) {
+          positions.push(position);
+          continue;
+        }
+
+        const pnlUsd = (price - position.entry) * position.qty;
+        cashToReturn += position.notionalUsd + pnlUsd;
+        closed.push({
+          ...position,
+          closedAtIso,
+          exit: price,
+          pnlUsd,
+          pnlPct: (pnlUsd / position.notionalUsd) * 100,
+          exitReason: hitStop ? "STOP_LOSS" : "TAKE_PROFIT",
+        });
+      }
+
+      if (!closed.length) return s;
+      return {
+        ...s,
+        cashUsd: s.cashUsd + cashToReturn,
+        positions,
+        history: [...closed, ...s.history].slice(0, 250),
+      };
+    });
+  }, [getSimPrice, market]);
 
   const signalCalibration = useMemo(() => {
     const checked = aiSignals.map((s) => {
@@ -2042,6 +2099,9 @@ export default function App() {
     if (price) {
       setEntryPrice(price);
       setStopPrice(setup?.support ?? price * 0.985);
+      const defaultStop = setup?.support && setup.support < price ? setup.support : price * 0.985;
+      setSimStopLossInput(defaultStop.toPrecision(8));
+      setSimTakeProfitInput((price + Math.max(price - defaultStop, price * 0.008) * 2).toPrecision(8));
     }
     if (idea.allocationUsd > 0) setSimBuyUsd(String(Math.min(simState.cashUsd, Math.round(idea.allocationUsd))));
     setSimThesis(`Real AI ${idea.action}: ${idea.thesis} Plan fit: ${idea.planFit}`);
@@ -2062,6 +2122,10 @@ export default function App() {
       alert("Buy amount is larger than your simulator cash.");
       return;
     }
+    if (!simStopLossValid || !simTakeProfitValid) {
+      alert("Set a stop loss below the current price and a take profit above the current price before buying.");
+      return;
+    }
 
     const setup = setups.find((s) => s.symbol === symbol);
     const position: SimPosition = {
@@ -2072,8 +2136,8 @@ export default function App() {
       entry: price,
       qty: notional / price,
       notionalUsd: notional,
-      stop: symbol === focusSymbol && stopDistanceLong > 0 ? stopPrice : undefined,
-      takeProfit: symbol === focusSymbol && tp2Long > 0 ? tp2Long : undefined,
+      stop: simStopLossValid ? simStopLoss : undefined,
+      takeProfit: simTakeProfitValid ? simTakeProfit : undefined,
       thesis: simThesis.trim() || undefined,
       source: setup ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}` : edgeGrade.label,
     };
@@ -2083,6 +2147,8 @@ export default function App() {
     if (price) {
       setEntryPrice(price);
       setStopPrice(price * 0.985);
+      setSimStopLossInput((price * 0.985).toPrecision(8));
+      setSimTakeProfitInput((price * 1.03).toPrecision(8));
     }
     setSimThesis("");
   };
@@ -2099,12 +2165,40 @@ export default function App() {
         exit,
         pnlUsd,
         pnlPct: (pnlUsd / position.notionalUsd) * 100,
+        exitReason: "MANUAL",
       };
       return {
         ...s,
         cashUsd: s.cashUsd + position.notionalUsd + pnlUsd,
         positions: s.positions.filter((p) => p.id !== id),
         history: [closed, ...s.history].slice(0, 250),
+      };
+    });
+  };
+
+  const updateSimHoldingExit = (id: string, field: "stop" | "takeProfit", raw: string) => {
+    const next = Number(raw);
+    setSimState((s) => {
+      const position = s.positions.find((p) => p.id === id);
+      if (!position) return s;
+      const now = getSimPrice(position.symbol) || position.entry;
+      if (!Number.isFinite(next) || next <= 0) {
+        return {
+          ...s,
+          positions: s.positions.map((p) => (p.id === id ? { ...p, [field]: undefined } : p)),
+        };
+      }
+      if (field === "stop" && next >= now) {
+        alert("Stop loss must be below the current market price.");
+        return s;
+      }
+      if (field === "takeProfit" && next <= now) {
+        alert("Take profit must be above the current market price.");
+        return s;
+      }
+      return {
+        ...s,
+        positions: s.positions.map((p) => (p.id === id ? { ...p, [field]: next } : p)),
       };
     });
   };
@@ -4238,6 +4332,62 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 10 }}>
+            <div style={subtle}>Stop loss / take profit</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
+              <input
+                style={{ ...input, borderColor: simStopLossInput && !simStopLossValid ? "#fecaca" : input.borderColor }}
+                inputMode="decimal"
+                value={simStopLossInput}
+                onChange={(e) => setSimStopLossInput(e.target.value)}
+                placeholder="Stop below price"
+              />
+              <input
+                style={{ ...input, borderColor: simTakeProfitInput && !simTakeProfitValid ? "#fecaca" : input.borderColor }}
+                inputMode="decimal"
+                value={simTakeProfitInput}
+                onChange={(e) => setSimTakeProfitInput(e.target.value)}
+                placeholder="Target above price"
+              />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginTop: 8 }}>
+              <button
+                style={btn}
+                onClick={() => {
+                  const stop = simulatorPrice * 0.99;
+                  setSimStopLossInput(stop.toPrecision(8));
+                  setSimTakeProfitInput((simulatorPrice + (simulatorPrice - stop) * 2).toPrecision(8));
+                }}
+              >
+                1% / 2R
+              </button>
+              <button
+                style={btn}
+                onClick={() => {
+                  const stop = simulatorPrice * 0.985;
+                  setSimStopLossInput(stop.toPrecision(8));
+                  setSimTakeProfitInput((simulatorPrice + (simulatorPrice - stop) * 2).toPrecision(8));
+                }}
+              >
+                1.5% / 2R
+              </button>
+              <button
+                style={btn}
+                onClick={() => {
+                  const stop = simulatorPrice * 0.98;
+                  setSimStopLossInput(stop.toPrecision(8));
+                  setSimTakeProfitInput((simulatorPrice + (simulatorPrice - stop) * 2).toPrecision(8));
+                }}
+              >
+                2% / 2R
+              </button>
+            </div>
+            <div style={{ ...subtle, marginTop: 8 }}>
+              Planned loss {simPlannedLossPct ? simPlannedLossPct.toFixed(2) : "0.00"}% · planned gain{" "}
+              {simPlannedGainPct ? simPlannedGainPct.toFixed(2) : "0.00"}% · R:R {simRewardRisk ? simRewardRisk.toFixed(2) : "0.00"}x
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
             <div style={subtle}>Why are you buying?</div>
             <input
               style={input}
@@ -4248,8 +4398,8 @@ export default function App() {
           </div>
 
           <button
-            style={{ ...(simCanBuySelected && advancedAi.shouldTrade ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
-            disabled={!simCanBuySelected || !advancedAi.shouldTrade}
+            style={{ ...(simCanBuySelected && advancedAi.shouldTrade && simStopLossValid && simTakeProfitValid ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
+            disabled={!simCanBuySelected || !advancedAi.shouldTrade || !simStopLossValid || !simTakeProfitValid}
             onClick={() => buySimCrypto(simSymbol)}
           >
             {advancedAi.shouldTrade ? `Buy ${simSymbol}` : `AI Caution: Wait on ${simSymbol}`}
@@ -4298,6 +4448,8 @@ export default function App() {
                     if (s.priceUsd) {
                       setEntryPrice(s.priceUsd);
                       setStopPrice(s.priceUsd * 0.985);
+                      setSimStopLossInput((s.priceUsd * 0.985).toPrecision(8));
+                      setSimTakeProfitInput((s.priceUsd * 1.03).toPrecision(8));
                     }
                   }}
                   style={{
@@ -4329,6 +4481,8 @@ export default function App() {
                       if (s.priceUsd) {
                         setEntryPrice(s.priceUsd);
                         setStopPrice(s.priceUsd * 0.985);
+                        setSimStopLossInput((s.priceUsd * 0.985).toPrecision(8));
+                        setSimTakeProfitInput((s.priceUsd * 1.03).toPrecision(8));
                       }
                     }}
                   >
@@ -4379,7 +4533,7 @@ export default function App() {
             {simState.positions.length === 0 ? (
               <div style={emptyState}>No simulated crypto bought yet. Pick a coin in the scanner universe, choose a buy amount, then use Buy.</div>
             ) : (
-              <table style={{ width: "100%", minWidth: 1040, borderCollapse: "separate", borderSpacing: "0 8px" }}>
+              <table style={{ width: "100%", minWidth: 1240, borderCollapse: "separate", borderSpacing: "0 8px" }}>
                 <thead>
                   <tr style={{ color: "#64748b", fontSize: "0.78rem", textAlign: "left" }}>
                     <th style={{ paddingLeft: 8 }}>Coin</th>
@@ -4388,6 +4542,8 @@ export default function App() {
                     <th>Qty</th>
                     <th>Value</th>
                     <th>P/L</th>
+                    <th>Stop</th>
+                    <th>Target</th>
                     <th>AI</th>
                     <th>Scanner</th>
                     <th />
@@ -4398,6 +4554,8 @@ export default function App() {
                     const now = getSimPrice(p.symbol) || p.entry;
                     const value = now * p.qty;
                     const pnl = (now - p.entry) * p.qty;
+                    const stopGapPct = p.stop ? ((now - p.stop) / now) * 100 : 0;
+                    const targetGapPct = p.takeProfit ? ((p.takeProfit - now) / now) * 100 : 0;
                     const review = holdingReviews.find((r) => r.id === p.id);
                     const realAiHolding = aiAdvisor?.portfolioReview.holdings.find((h) => h.symbol.toUpperCase() === p.symbol.toUpperCase());
                     const realAiTone =
@@ -4414,6 +4572,32 @@ export default function App() {
                         <td style={{ padding: "10px 8px" }}>{p.qty.toFixed(6)}</td>
                         <td style={{ padding: "10px 8px" }}>{fmtUsd(value)}</td>
                         <td style={{ padding: "10px 8px", color: pnl >= 0 ? "#047857" : "#b91c1c", fontWeight: 950 }}>{fmtUsd(pnl)}</td>
+                        <td style={{ padding: "10px 8px", minWidth: 130 }}>
+                          <input
+                            style={{ ...input, padding: "7px 8px", borderColor: p.stop ? "#fecaca" : "#cbd5e1" }}
+                            inputMode="decimal"
+                            defaultValue={p.stop ? p.stop.toPrecision(8) : ""}
+                            onBlur={(e) => updateSimHoldingExit(p.id, "stop", e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") e.currentTarget.blur();
+                            }}
+                            placeholder="No stop"
+                          />
+                          <div style={{ ...subtle, marginTop: 4 }}>{p.stop ? `${stopGapPct.toFixed(2)}% away` : "Unprotected"}</div>
+                        </td>
+                        <td style={{ padding: "10px 8px", minWidth: 130 }}>
+                          <input
+                            style={{ ...input, padding: "7px 8px", borderColor: p.takeProfit ? "#bbf7d0" : "#cbd5e1" }}
+                            inputMode="decimal"
+                            defaultValue={p.takeProfit ? p.takeProfit.toPrecision(8) : ""}
+                            onBlur={(e) => updateSimHoldingExit(p.id, "takeProfit", e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") e.currentTarget.blur();
+                            }}
+                            placeholder="No target"
+                          />
+                          <div style={{ ...subtle, marginTop: 4 }}>{p.takeProfit ? `${targetGapPct.toFixed(2)}% away` : "No exit"}</div>
+                        </td>
                         <td style={{ padding: "10px 8px", minWidth: 210 }}>
                           {realAiHolding ? (
                             <div>
@@ -4456,6 +4640,8 @@ export default function App() {
                                 setFocusSymbol(p.symbol);
                                 setEntryPrice(now);
                                 setStopPrice(p.stop ?? now * 0.985);
+                                setSimStopLossInput((p.stop ?? now * 0.985).toPrecision(8));
+                                setSimTakeProfitInput((p.takeProfit ?? now * 1.03).toPrecision(8));
                                 setSimBuyUsd(String(review.addUsd || 50));
                                 setSimThesis(`AI holding review: increase ${p.symbol}. ${review.reasons.join(" ")}`);
                               }}
@@ -4475,6 +4661,8 @@ export default function App() {
                               setFocusSymbol(p.symbol);
                               setEntryPrice(now);
                               setStopPrice(p.stop ?? now * 0.985);
+                              setSimStopLossInput((p.stop ?? now * 0.985).toPrecision(8));
+                              setSimTakeProfitInput((p.takeProfit ?? now * 1.03).toPrecision(8));
                             }}
                           >
                             Review
@@ -4510,7 +4698,14 @@ export default function App() {
               simState.history.map((t) => (
                 <div key={t.id} style={{ ...statCard, marginBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                    <div style={{ fontWeight: 950 }}>Bought and sold {t.symbol}</div>
+                    <div style={{ fontWeight: 950 }}>
+                      Bought and sold {t.symbol}
+                      {t.exitReason && (
+                        <span style={{ ...pill, marginLeft: 8, color: t.exitReason === "TAKE_PROFIT" ? "#047857" : t.exitReason === "STOP_LOSS" ? "#b91c1c" : "#111827" }}>
+                          {t.exitReason.replace("_", " ")}
+                        </span>
+                      )}
+                    </div>
                     <div style={{ color: t.pnlUsd >= 0 ? "#047857" : "#b91c1c", fontWeight: 950 }}>
                       {fmtUsd(t.pnlUsd)} ({t.pnlPct >= 0 ? "+" : ""}
                       {t.pnlPct.toFixed(2)}%)
@@ -4518,6 +4713,9 @@ export default function App() {
                   </div>
                   <div style={{ ...subtle, marginTop: 8 }}>
                     Buy {fmtUsd(t.entry)} · Sell {fmtUsd(t.exit)} · {new Date(t.closedAtIso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                  <div style={{ ...subtle, marginTop: 8 }}>
+                    Stop {t.stop ? fmtUsd(t.stop) : "none"} · Target {t.takeProfit ? fmtUsd(t.takeProfit) : "none"}
                   </div>
                   <div style={{ ...subtle, marginTop: 8 }}>Scanner tag: {t.source}</div>
                   {t.thesis && <div style={{ ...subtle, marginTop: 8 }}>{t.thesis}</div>}
