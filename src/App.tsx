@@ -1723,14 +1723,30 @@ export default function App() {
     return { rows, trades, wins, winRate, expectancyPct, best, worst };
   }, [microMap, setups]);
 
+  const todaySimProgress = useMemo(() => {
+    const realizedToday = simState.history
+      .filter((t) => dayKeyLocal(new Date(t.closedAtIso)) === todayKey)
+      .reduce((acc, t) => acc + t.pnlUsd, 0);
+    const openToday = simState.positions
+      .filter((p) => dayKeyLocal(new Date(p.openedAtIso)) === todayKey)
+      .reduce((acc, p) => {
+        const price = getSimPrice(p.symbol) || p.entry;
+        return acc + (price - p.entry) * p.qty;
+      }, 0);
+    const pnlUsd = realizedToday + openToday;
+    const basis = Math.max(100, simEquity - pnlUsd);
+    return { basis, pnlUsd, realizedToday, openToday };
+  }, [getSimPrice, simEquity, simState.history, simState.positions, todayKey]);
+
   const planProgress = useMemo(() => {
     const targetReturnPct = goalPlan?.targetReturnPct ?? 3;
-    const horizonDays = Math.max(1, goalPlan?.horizonDays ?? 7);
+    const isDailyPlan = (goalPlan?.targetPeriod ?? "day") === "day";
+    const horizonDays = isDailyPlan ? 1 : Math.max(1, goalPlan?.horizonDays ?? 7);
     const maxDailyLossPct = goalPlan?.maxDailyLossPct ?? 1.5;
-    const basis = goalPlan?.startingEquityUsd ?? simState.startingCashUsd;
+    const basis = isDailyPlan ? todaySimProgress.basis : goalPlan?.startingEquityUsd ?? simState.startingCashUsd;
     const targetUsd = basis * (targetReturnPct / 100);
     const maxLossUsd = basis * (maxDailyLossPct / 100);
-    const pnlUsd = simEquity - simState.startingCashUsd;
+    const pnlUsd = isDailyPlan ? todaySimProgress.pnlUsd : simEquity - simState.startingCashUsd;
     const progressPct = targetUsd > 0 ? clamp((pnlUsd / targetUsd) * 100, -100, 200) : 0;
     const lossUsedPct = maxLossUsd > 0 ? clamp((Math.max(0, -pnlUsd) / maxLossUsd) * 100, 0, 200) : 0;
     const dailyTargetUsd = targetUsd / horizonDays;
@@ -1742,8 +1758,8 @@ export default function App() {
           : progressPct >= 70
             ? "NEAR GOAL"
             : "ACTIVE";
-    return { targetReturnPct, horizonDays, maxDailyLossPct, basis, targetUsd, maxLossUsd, pnlUsd, progressPct, lossUsedPct, dailyTargetUsd, status };
-  }, [goalPlan, simEquity, simState.startingCashUsd]);
+    return { targetReturnPct, horizonDays, maxDailyLossPct, basis, targetUsd, maxLossUsd, pnlUsd, progressPct, lossUsedPct, dailyTargetUsd, status, isDailyPlan };
+  }, [goalPlan, simEquity, simState.startingCashUsd, todaySimProgress.basis, todaySimProgress.pnlUsd]);
 
   const advancedAi = useMemo(() => {
     const score = simSelectedSetup?.combinedScore ?? 0;
@@ -3993,6 +4009,11 @@ export default function App() {
                   ? `${goalPlan.goalName}: ${goalPlan.strategyProfile} mode targeting +${goalPlan.targetReturnPct}% per ${goalPlan.targetPeriod} while respecting a -${goalPlan.maxDailyLossPct}% stop.`
                   : "Create a commitment plan first. The AI will block new buys until a risk plan is accepted."}
               </div>
+              {goalPlan && planProgress.isDailyPlan && (
+                <div style={{ ...subtle, marginTop: 6 }}>
+                  Daily reset is active for {todayKey}: today P/L {fmtUsd(todaySimProgress.pnlUsd)} from realized {fmtUsd(todaySimProgress.realizedToday)} and open {fmtUsd(todaySimProgress.openToday)}.
+                </div>
+              )}
               <div style={{ marginTop: 12, height: 8, borderRadius: 999, background: "#dbeafe", overflow: "hidden" }}>
                 <div
                   style={{
