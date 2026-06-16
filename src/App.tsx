@@ -1944,8 +1944,8 @@ export default function App() {
   const simBuyAllowed =
     simCanBuySelected &&
     simStopLossValid &&
-    simTakeProfitValid &&
-    (simTradeMode === "SCALP" ? scalpModeCanBuy : advancedAi.shouldTrade);
+    simTakeProfitValid;
+  const simTradeWarningActive = simTradeMode === "SCALP" ? !scalpModeCanBuy : !advancedAi.shouldTrade;
   const simBuyBlocker =
     simTradeMode === "SCALP"
       ? selectedScalpSignal?.warnings[0] ?? "Quick scalp needs a SCALP TEST signal."
@@ -2337,15 +2337,6 @@ export default function App() {
       alert("Set a stop loss below the current price and a take profit above the current price before buying.");
       return;
     }
-    if (simTradeMode === "NORMAL" && !advancedAi.shouldTrade) {
-      alert("Normal scanner AI says wait on this coin.");
-      return;
-    }
-    if (simTradeMode === "SCALP" && selectedScalpSignal?.action !== "SCALP_TEST") {
-      alert("Quick Scalp mode only allows buys when the burst scanner says SCALP TEST.");
-      return;
-    }
-
     const setup = setups.find((s) => s.symbol === symbol);
     const position: SimPosition = {
       id: uuid(),
@@ -2360,11 +2351,13 @@ export default function App() {
       takeProfit: simTakeProfitValid ? simTakeProfit : undefined,
       thesis: simThesis.trim() || undefined,
       source:
-        simTradeMode === "SCALP" && selectedScalpSignal
-          ? `SCALP / ${selectedScalpSignal.action} / ${selectedScalpSignal.burstScore}`
-          : setup
-            ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}`
-            : edgeGrade.label,
+        `${simTradeWarningActive ? "WARN / " : ""}${
+          simTradeMode === "SCALP" && selectedScalpSignal
+            ? `SCALP / ${selectedScalpSignal.action} / ${selectedScalpSignal.burstScore}`
+            : setup
+              ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}`
+              : edgeGrade.label
+        }`,
     };
     setSimState((s) => ({ ...s, cashUsd: s.cashUsd - notional, positions: [position, ...s.positions] }));
     setSimSymbol(symbol);
@@ -4591,7 +4584,7 @@ export default function App() {
         </div>
 
         <div style={{ ...subtle, marginTop: 10 }}>
-          Scalp rules: smaller size, mandatory stop, mandatory target, and exit fast. If the card says TOO LATE, the simulator treats it as a chase and blocks the buy.
+          Scalp rules: smaller size, mandatory stop, mandatory target, and exit fast. If the card says TOO LATE, the simulator warns you hard instead of blocking the buy.
         </div>
       </div>
 
@@ -4750,20 +4743,31 @@ export default function App() {
             />
           </div>
 
+          {simCanBuySelected && simStopLossValid && simTakeProfitValid && simTradeWarningActive && (
+            <div style={{ ...statCard, marginTop: 10, borderColor: "#fed7aa", background: "#fff7ed" }}>
+              <div style={{ fontWeight: 950, color: "#9a3412" }}>{simTradeMode === "SCALP" ? "Scalp warning" : "AI warning"}</div>
+              <div style={{ ...subtle, marginTop: 6 }}>
+                {simBuyBlocker} This is allowed in the simulator, but the trade will be marked as a warning entry.
+              </div>
+            </div>
+          )}
+
           <button
-            style={{ ...(simBuyAllowed ? btn : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
+            style={{ ...(simBuyAllowed ? (simTradeWarningActive ? btnDanger : btn) : btnDisabled), width: "100%", marginTop: 12, padding: "11px 12px" }}
             disabled={!simBuyAllowed}
             onClick={() => buySimCrypto(simSymbol)}
           >
-            {simBuyAllowed ? `Buy ${simSymbol}` : simTradeMode === "SCALP" ? `Scalp Caution: Wait on ${simSymbol}` : `AI Caution: Wait on ${simSymbol}`}
+            {simBuyAllowed ? (simTradeWarningActive ? `Buy Anyway: ${simSymbol}` : `Buy ${simSymbol}`) : `Complete Ticket for ${simSymbol}`}
           </button>
 
           <div style={{ ...subtle, marginTop: 10 }}>
             {!simCanBuySelected
               ? "Coins are listed, but this coin needs a live price before buying is enabled. Use Refresh Market or run through localhost:8888."
-              : simBuyAllowed
-                ? `Buying uses the current market price. Time left: ${simDaysLeft.toFixed(1)} days.`
-                : `${simTradeMode === "SCALP" ? "Scalp caution" : "AI caution"}: ${simBuyBlocker}`}
+              : !simStopLossValid || !simTakeProfitValid
+                ? "Set a stop loss below price and take profit above price before the simulator can record the trade."
+                : simTradeWarningActive
+                  ? `${simTradeMode === "SCALP" ? "Scalp warning" : "AI warning"}: ${simBuyBlocker} You can still buy in the simulator.`
+                  : `Buying uses the current market price. Time left: ${simDaysLeft.toFixed(1)} days.`}
           </div>
         </div>
 
