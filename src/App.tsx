@@ -232,9 +232,12 @@ type ScalpSignal = {
   symbol: string;
   price: number;
   burstScore: number;
+  legsScore: number;
+  peakRiskScore: number;
   action: "SCALP_TEST" | "WATCH" | "TOO_LATE" | "NO_LIQUIDITY";
   tone: string;
   speedLabel: string;
+  legsLabel: string;
   stop: number;
   target: number;
   holdWindow: string;
@@ -1583,35 +1586,43 @@ export default function App() {
         const volumeScore = clamp(Math.log10(Math.max(1, s.volFactor)) * 36 + 42, 0, 100);
         const momentumScore = clamp(42 + fastMove * 17 + acceleration * 14 + Math.max(0, move4h) * 3 + Math.max(0, ch24) * 0.9, 0, 100);
         const liquidityOk = s.volFactor >= 1.15 && price > 0;
-        const tooLate = (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
+        const spike6h = s.spikeFromLow6h ?? Math.max(0, move4h);
+        const dropFromHigh = s.dropFromHigh6h ?? 0;
+        const peakRiskScore = Math.round(clamp(spike6h * 6 + Math.max(0, ch24 - 12) * 3 + Math.max(0, -acceleration) * 18 + Math.max(0, -dropFromHigh - 1.5) * 8, 0, 100));
+        const legsScore = Math.round(clamp(58 + acceleration * 22 + Math.max(0, fastMove) * 8 + Math.max(0, move4h) * 2 - peakRiskScore * 0.55 + (liquidityOk ? 8 : -10), 0, 100));
+        const peakRisk = peakRiskScore >= 58 || (spike6h >= 8 && acceleration <= 0.15);
+        const tooLate = peakRisk || (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
         const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || fastMove <= -1.4 || ch24 <= -5;
-        const earlyBurst = hasMicro && fastMove >= 0.35 && acceleration > 0.08 && (s.spikeFromLow6h ?? 0) < 8;
+        const earlyBurst = hasMicro && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 8 && legsScore >= 55;
         const warming = hasMicro && fastMove >= 0.1 && acceleration > 0 && move4h > 0;
         const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
         const freshnessBonus = hasMicro ? 10 : -8;
-        const burstScore = Math.round(clamp(momentumScore * 0.68 + volumeScore * 0.32 + (earlyBurst ? 12 : warming ? 6 : 0) + freshnessBonus - (tooLate ? 26 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
+        const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
         const targetPct = clamp(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), 0.85, 3.4);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
-        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
+        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 55 && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
         const speedLabel = hasMicro ? (earlyBurst ? "EARLY BURST" : acceleration > 0 ? "ACCELERATING" : "FADING") : "NEEDS MICRO";
+        const legsLabel = legsScore >= 70 ? "HAS LEGS" : peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 50 ? "MAYBE LEGS" : "NO LEGS";
         const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "5 to 25 minutes. Take profit fast or trail manually." : "5 to 45 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
           `Burst score ${burstScore}/100`,
           hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
           `Accel ${acceleration >= 0 ? "+" : ""}${acceleration.toFixed(2)}`,
+          `Legs ${legsScore}/100`,
           `Volume ${s.volFactor.toFixed(2)}x baseline`,
         ];
         const warnings: string[] = [];
         if (!hasMicro) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
-        if (tooLate) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
+        if (peakRisk) warnings.push(`Peak risk: +${spike6h.toFixed(2)}% from 6h low with limited fresh acceleration.`);
+        if (tooLate && !peakRisk) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
         if (dumpRisk) warnings.push("Recent pullback/dump risk or fast 1h weakness is active.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
-        return { symbol: s.symbol, price, burstScore, action, tone, speedLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
+        return { symbol: s.symbol, price, burstScore, legsScore, peakRiskScore, action, tone, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
       })
       .filter((s) => s.price > 0)
       .sort((a, b) => b.burstScore - a.burstScore)
@@ -1619,6 +1630,7 @@ export default function App() {
   }, [getSimPrice, setups, simState.cashUsd]);
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
   const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
+  const scalpSignalBySymbol = useMemo(() => new Map(scalpSignals.map((s) => [s.symbol, s])), [scalpSignals]);
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
     const base = setups.length ? setups : COINS.map((c) => ({
@@ -4515,10 +4527,18 @@ export default function App() {
                   </div>
                   <span style={{ ...pill, color: signal.tone }}>{signal.burstScore}/100</span>
                 </div>
-                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")} · {signal.speedLabel}</div>
+                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")} · {signal.speedLabel} · {signal.legsLabel}</div>
                 <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
                 {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={subtle}>Legs</div>
+                    <div style={{ fontWeight: 900, color: signal.legsScore >= 55 ? "#047857" : "#b91c1c" }}>{signal.legsScore}</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Peak</div>
+                    <div style={{ fontWeight: 900, color: signal.peakRiskScore >= 58 ? "#b91c1c" : "#047857" }}>{signal.peakRiskScore}</div>
+                  </div>
                   <div>
                     <div style={subtle}>Stop</div>
                     <div style={{ fontWeight: 900, color: "#b91c1c" }}>{fmtUsd(signal.stop)}</div>
@@ -4539,7 +4559,7 @@ export default function App() {
                     setSimStopLossInput(signal.stop.toPrecision(8));
                     setSimTakeProfitInput(signal.target.toPrecision(8));
                     setSimBuyUsd(String(signal.suggestedUsd || 50));
-                    setSimThesis(`Quick scalp ${signal.speedLabel}: ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
+                    setSimThesis(`Quick scalp ${signal.speedLabel} ${signal.legsLabel}: legs ${signal.legsScore}/100, peak risk ${signal.peakRiskScore}/100. ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
                   }}
                 >
                   Load Scalp Ticket
@@ -4766,12 +4786,19 @@ export default function App() {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10, marginTop: 12, maxHeight: 520, overflow: "auto", paddingRight: 4 }}>
             {simCoinChoices.map((s) => {
               const selected = s.symbol === simSymbol;
+              const scalpSignal = scalpSignalBySymbol.get(s.symbol);
               const coinVerdict =
-                s.priceUsd && s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70
-                  ? "AI: Test"
-                  : s.priceUsd
-                    ? "AI: Watch"
-                    : "Loading";
+                scalpSignal?.legsLabel === "HAS LEGS" && scalpSignal.action === "SCALP_TEST"
+                  ? "LEGS"
+                  : scalpSignal?.legsLabel === "PEAK RISK" || scalpSignal?.action === "TOO_LATE"
+                    ? "PEAK RISK"
+                    : scalpSignal?.speedLabel === "FADING"
+                      ? "FADING"
+                      : s.priceUsd && s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70
+                        ? "WATCH"
+                        : s.priceUsd
+                          ? "WAIT"
+                          : "Loading";
               return (
                 <div
                   key={s.symbol}
@@ -4802,8 +4829,21 @@ export default function App() {
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
                     <span style={{ ...pill, borderRadius: 7, color: s.entryQuality === "VALID" ? "#047857" : "#92400e" }}>{s.entryQuality}</span>
                     <span style={{ ...pill, borderRadius: 7, color: s.structureLabel === "OK" ? "#047857" : "#92400e" }}>{s.structureLabel}</span>
-                    <span style={{ ...pill, borderRadius: 7, color: coinVerdict === "AI: Test" ? "#047857" : "#64748b" }}>{coinVerdict}</span>
+                    <span
+                      style={{
+                        ...pill,
+                        borderRadius: 7,
+                        color: coinVerdict === "LEGS" ? "#047857" : coinVerdict === "PEAK RISK" || coinVerdict === "FADING" ? "#b91c1c" : "#64748b",
+                      }}
+                    >
+                      {coinVerdict}
+                    </span>
                   </div>
+                  {scalpSignal && (
+                    <div style={{ ...subtle, marginTop: 8 }}>
+                      Legs {scalpSignal.legsScore}/100 · Peak risk {scalpSignal.peakRiskScore}/100 · {scalpSignal.speedLabel}
+                    </div>
+                  )}
                   <button
                     style={{ ...(s.priceUsd ? btn : btnDisabled), marginTop: 10, width: "100%" }}
                     disabled={!s.priceUsd}
