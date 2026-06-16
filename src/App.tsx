@@ -1600,13 +1600,37 @@ export default function App() {
         const liquidityOk = s.volFactor >= 1.15 && price > 0;
         const spike6h = s.spikeFromLow6h ?? Math.max(0, move4h);
         const dropFromHigh = s.dropFromHigh6h ?? 0;
-        const peakRiskScore = Math.round(clamp(spike6h * 6 + Math.max(0, ch24 - 12) * 3 + Math.max(0, -acceleration) * 18 + Math.max(0, -dropFromHigh - 1.5) * 8, 0, 100));
-        const legsScore = Math.round(clamp(58 + acceleration * 22 + Math.max(0, fastMove) * 8 + Math.max(0, move4h) * 2 - peakRiskScore * 0.55 + (liquidityOk ? 8 : -10), 0, 100));
+        const latestWeak = hasMicro && fastMove <= 0;
+        const stalling = hasMicro && fastMove < 0.18 && acceleration <= 0.28;
+        const rollingOver = latestWeak || (dropFromHigh <= -1.2 && acceleration <= 0.28) || (spike6h >= 5 && stalling);
+        const continuationOk = hasMicro && fastMove > 0.18 && acceleration > 0.05 && dropFromHigh > -1.8;
+        const peakRiskScore = Math.round(clamp(
+          spike6h * 6 +
+            Math.max(0, ch24 - 12) * 3 +
+            Math.max(0, -acceleration) * 18 +
+            Math.max(0, -dropFromHigh - 1.5) * 8 +
+            (rollingOver ? 30 : 0) +
+            (latestWeak ? 18 : 0),
+          0,
+          100
+        ));
+        const legsScore = Math.round(clamp(
+          58 +
+            acceleration * 18 +
+            Math.max(0, fastMove) * 8 +
+            Math.max(0, move4h) * 2 -
+            peakRiskScore * 0.55 +
+            (liquidityOk ? 8 : -10) -
+            (rollingOver ? 24 : 0) -
+            (latestWeak ? 16 : 0),
+          0,
+          100
+        ));
         const peakRisk = peakRiskScore >= 58 || (spike6h >= 8 && acceleration <= 0.15);
-        const tooLate = peakRisk || (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
+        const tooLate = peakRisk || rollingOver || (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
         const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || fastMove <= -1.4 || ch24 <= -5;
-        const earlyBurst = hasMicro && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 8 && legsScore >= 55;
-        const warming = hasMicro && fastMove >= 0.1 && acceleration > 0 && move4h > 0;
+        const earlyBurst = hasMicro && !rollingOver && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 8 && legsScore >= 55;
+        const warming = hasMicro && !rollingOver && fastMove >= 0.1 && acceleration > 0 && move4h > 0;
         const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
         const freshnessBonus = hasMicro ? 10 : -8;
         const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
@@ -1614,10 +1638,10 @@ export default function App() {
         const targetPct = clamp(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), 0.85, 3.4);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
-        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 55 && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
+        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 55 && continuationOk && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
-        const speedLabel = hasMicro ? (earlyBurst ? "EARLY BURST" : acceleration > 0 ? "ACCELERATING" : "FADING") : "NEEDS MICRO";
-        const legsLabel = legsScore >= 70 ? "HAS LEGS" : peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 50 ? "MAYBE LEGS" : "NO LEGS";
+        const speedLabel = hasMicro ? (rollingOver ? "FADING" : earlyBurst ? "EARLY BURST" : continuationOk ? "ACCELERATING" : "WATCHING") : "NEEDS MICRO";
+        const legsLabel = peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 70 && continuationOk ? "HAS LEGS" : legsScore >= 50 && !rollingOver ? "MAYBE LEGS" : "NO LEGS";
         const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "5 to 25 minutes. Take profit fast or trail manually." : "5 to 45 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
@@ -1629,6 +1653,8 @@ export default function App() {
         ];
         const warnings: string[] = [];
         if (!hasMicro) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
+        if (latestWeak) warnings.push("Latest 1h is red; wait for reclaim before entering.");
+        if (rollingOver && !latestWeak) warnings.push("Rolling over from recent high; do not buy the first red turn.");
         if (peakRisk) warnings.push(`Peak risk: +${spike6h.toFixed(2)}% from 6h low with limited fresh acceleration.`);
         if (tooLate && !peakRisk) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
         if (dumpRisk) warnings.push("Recent pullback/dump risk or fast 1h weakness is active.");
@@ -4535,7 +4561,7 @@ export default function App() {
                 <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")} · {signal.speedLabel} · {signal.legsLabel}</div>
                 <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
                 {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
                   <div>
                     <div style={subtle}>Legs</div>
                     <div style={{ fontWeight: 900, color: signal.legsScore >= 55 ? "#047857" : "#b91c1c" }}>{signal.legsScore}</div>
@@ -4546,11 +4572,11 @@ export default function App() {
                   </div>
                   <div>
                     <div style={subtle}>Stop</div>
-                    <div style={{ fontWeight: 900, color: "#b91c1c" }}>{fmtUsd(signal.stop)}</div>
+                    <div style={{ fontWeight: 900, color: "#b91c1c", overflowWrap: "anywhere" }}>{fmtUsd(signal.stop)}</div>
                   </div>
                   <div>
                     <div style={subtle}>Target</div>
-                    <div style={{ fontWeight: 900, color: "#047857" }}>{fmtUsd(signal.target)}</div>
+                    <div style={{ fontWeight: 900, color: "#047857", overflowWrap: "anywhere" }}>{fmtUsd(signal.target)}</div>
                   </div>
                 </div>
                 <button
