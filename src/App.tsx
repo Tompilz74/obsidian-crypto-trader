@@ -234,6 +234,7 @@ type ScalpSignal = {
   burstScore: number;
   action: "SCALP_TEST" | "WATCH" | "TOO_LATE" | "NO_LIQUIDITY";
   tone: string;
+  speedLabel: string;
   stop: number;
   target: number;
   holdWindow: string;
@@ -1261,6 +1262,18 @@ export default function App() {
         .sort((a, b) => b.combined - a.combined)
         .slice(0, 10);
 
+      const scalpRankedTemp = merged
+        .map((m) => {
+          const vol = m.volume24hUsd ?? 0;
+          const volFactor = baselineVolTemp > 0 ? vol / baselineVolTemp : 1;
+          const ch = m.change24h ?? 0;
+          const scalpPriority = Math.max(0, ch) * 7 + Math.log10(Math.max(1, volFactor)) * 28;
+          return { symbol: m.symbol, cgId: m.cgId, scalpPriority };
+        })
+        .filter((x) => !!x.cgId && x.scalpPriority > 8)
+        .sort((a, b) => b.scalpPriority - a.scalpPriority)
+        .slice(0, 14);
+
       // ---- Phase 2B: micro entry-quality (CoinGecko hourly)
       try {
         const pairs = await Promise.all(
@@ -1274,6 +1287,22 @@ export default function App() {
         setMicroMap((prev) => ({ ...prev, ...next }));
       } catch {
         // keep previous microMap if chart calls fail
+      }
+
+      // ---- Quick scalp micro refresh: prioritize fresh 1h/4h acceleration for fast movers
+      try {
+        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 8);
+        const scalpPairs = await Promise.all(
+          scalpTargets.map(async (x) => {
+            const prices = await fetchCoinGeckoHourly24h(x.cgId!);
+            return [x.symbol, computeMicro(prices)] as const;
+          })
+        );
+        const next: MicroMap = {};
+        for (const [sym, metrics] of scalpPairs) next[sym] = metrics;
+        setMicroMap((prev) => ({ ...prev, ...next }));
+      } catch {
+        // keep previous scalp micro data if chart calls fail
       }
 
       // ---- Phase 3: structure engine (Coinbase 1h) for TOP candidates only
@@ -1547,33 +1576,42 @@ export default function App() {
       .map((s) => {
         const price = getSimPrice(s.symbol) || s.priceUsd || 0;
         const ch24 = s.change24h ?? 0;
+        const hasMicro = typeof s.ret1h === "number" && typeof s.ret4h === "number";
         const fastMove = typeof s.ret1h === "number" ? s.ret1h : ch24 * 0.16;
+        const move4h = typeof s.ret4h === "number" ? s.ret4h : ch24 * 0.38;
+        const acceleration = fastMove - move4h / 4;
         const volumeScore = clamp(Math.log10(Math.max(1, s.volFactor)) * 36 + 42, 0, 100);
-        const momentumScore = clamp(48 + fastMove * 12 + Math.max(0, ch24) * 2.2, 0, 100);
+        const momentumScore = clamp(42 + fastMove * 17 + acceleration * 14 + Math.max(0, move4h) * 3 + Math.max(0, ch24) * 0.9, 0, 100);
         const liquidityOk = s.volFactor >= 1.15 && price > 0;
-        const tooLate = ch24 >= 18 || fastMove >= 5 || (s.spikeFromLow6h ?? 0) >= 9;
-        const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || ch24 <= -4;
+        const tooLate = (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
+        const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || fastMove <= -1.4 || ch24 <= -5;
+        const earlyBurst = hasMicro && fastMove >= 0.35 && acceleration > 0.08 && (s.spikeFromLow6h ?? 0) < 8;
+        const warming = hasMicro && fastMove >= 0.1 && acceleration > 0 && move4h > 0;
         const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
-        const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.42 - (tooLate ? 22 : 0) - (dumpRisk ? 18 : 0) - structurePenalty, 0, 100));
-        const stopPct = clamp(Math.max(0.55, Math.min(1.9, Math.abs(fastMove) * 0.22 + Math.abs(ch24) * 0.035)), 0.55, 1.9);
-        const targetPct = clamp(stopPct * (tooLate ? 1.15 : 1.7), 0.9, 3.2);
+        const freshnessBonus = hasMicro ? 10 : -8;
+        const burstScore = Math.round(clamp(momentumScore * 0.68 + volumeScore * 0.32 + (earlyBurst ? 12 : warming ? 6 : 0) + freshnessBonus - (tooLate ? 26 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
+        const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
+        const targetPct = clamp(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), 0.85, 3.4);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
-        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 72 && fastMove > 0.25 ? "SCALP_TEST" : burstScore >= 58 ? "WATCH" : "NO_LIQUIDITY";
+        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
-        const holdWindow = action === "SCALP_TEST" ? "5 to 45 minutes, exit at stop/target or if momentum fades." : "Wait for a cleaner burst; do not force entry.";
-        const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * 0.08), 150)) : 0;
+        const speedLabel = hasMicro ? (earlyBurst ? "EARLY BURST" : acceleration > 0 ? "ACCELERATING" : "FADING") : "NEEDS MICRO";
+        const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "5 to 25 minutes. Take profit fast or trail manually." : "5 to 45 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
+        const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
           `Burst score ${burstScore}/100`,
-          `Fast move proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
+          hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
+          `Accel ${acceleration >= 0 ? "+" : ""}${acceleration.toFixed(2)}`,
           `Volume ${s.volFactor.toFixed(2)}x baseline`,
         ];
         const warnings: string[] = [];
-        if (tooLate) warnings.push("Move looks extended; likely late chase risk.");
-        if (dumpRisk) warnings.push("Recent pullback/dump risk is active.");
+        if (!hasMicro) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
+        if (tooLate) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
+        if (dumpRisk) warnings.push("Recent pullback/dump risk or fast 1h weakness is active.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
-        return { symbol: s.symbol, price, burstScore, action, tone, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
+        return { symbol: s.symbol, price, burstScore, action, tone, speedLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
       })
       .filter((s) => s.price > 0)
       .sort((a, b) => b.burstScore - a.burstScore)
@@ -4477,7 +4515,7 @@ export default function App() {
                   </div>
                   <span style={{ ...pill, color: signal.tone }}>{signal.burstScore}/100</span>
                 </div>
-                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")}</div>
+                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")} · {signal.speedLabel}</div>
                 <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
                 {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
@@ -4501,7 +4539,7 @@ export default function App() {
                     setSimStopLossInput(signal.stop.toPrecision(8));
                     setSimTakeProfitInput(signal.target.toPrecision(8));
                     setSimBuyUsd(String(signal.suggestedUsd || 50));
-                    setSimThesis(`Quick scalp: ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
+                    setSimThesis(`Quick scalp ${signal.speedLabel}: ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
                   }}
                 >
                   Load Scalp Ticket
