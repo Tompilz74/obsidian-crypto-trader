@@ -319,16 +319,19 @@ function uuid() {
 
 /**
  * Session windows heuristic (LOCAL MACHINE TIME)
- * - ASIA:   07:00–16:00
+ * - FIJI DAYTIME: weak on normal weekdays, based on simulator learning
  * - EUROPE: 16:00–21:00
  * - OVERLAP:21:00–01:00
  * - US:     01:00–06:00
- * - OFF:    06:00–07:00
+ * - US WEEKEND: weekend + Fiji Monday morning exception
  */
 function computeSession(now: Date): SessionInfo {
   const h = now.getHours();
   const m = now.getMinutes();
   const curMinutes = h * 60 + m;
+  const day = now.getDay();
+  const isWeekend = day === 0 || day === 6;
+  const isMondayMorning = day === 1 && curMinutes < 12 * 60;
 
   const B_ASIA = 7 * 60;
   const B_EU = 16 * 60;
@@ -349,15 +352,20 @@ function computeSession(now: Date): SessionInfo {
     return d;
   };
 
-  if (curMinutes >= B_ASIA && curMinutes < B_EU) {
-    session = "ASIA";
+  if ((isWeekend || isMondayMorning) && curMinutes >= B_OFF_END && curMinutes < B_EU) {
+    session = "US WEEKEND";
     status = "SELECTIVE";
-    note = "Decent for some alts/scalps. Be picky (A+ only).";
+    note = "Weekend / US-Sunday flow. Crypto can move, but liquidity is thinner; scalp only clean legs-left setups.";
+    nextChangeAt = makeNext(16, 0, 0);
+  } else if (curMinutes >= B_ASIA && curMinutes < B_EU) {
+    session = "ASIA";
+    status = "WAIT";
+    note = "Your simulator learning says Fiji daytime is a weak trading window. Prefer afternoon onward unless a rare clean scalp appears.";
     nextChangeAt = makeNext(16, 0, 0);
   } else if (curMinutes >= B_EU && curMinutes < B_OVERLAP) {
     session = "EUROPE";
     status = "TRADE";
-    note = "Good activity. Trade A+ setups only.";
+    note = "Preferred window starts here. Better liquidity than Fiji daytime; trade A+ setups only.";
     nextChangeAt = makeNext(21, 0, 0);
   } else if (curMinutes >= B_OVERLAP || curMinutes < B_0100) {
     session = "EUROPE + US OVERLAP";
@@ -367,18 +375,21 @@ function computeSession(now: Date): SessionInfo {
   } else if (curMinutes >= B_0100 && curMinutes < B_US_END) {
     session = "US";
     status = "TRADE";
-    note = "Strong activity. Don’t overtrade.";
+    note = "Strong activity. Good window, but don’t overtrade.";
     nextChangeAt = makeNext(6, 0, 0);
   } else if (curMinutes >= B_US_END && curMinutes < B_OFF_END) {
-    session = "OFF-PEAK";
-    status = "WAIT";
-    note = "Thin/awkward window. Avoid forcing trades; wait for Asia/Europe.";
+    session = isWeekend || isMondayMorning ? "US WEEKEND" : "OFF-PEAK";
+    status = isWeekend || isMondayMorning ? "SELECTIVE" : "WAIT";
+    note =
+      isWeekend || isMondayMorning
+        ? "US weekend tail. Selective only; wait for momentum with legs left."
+        : "Thin/awkward window. Avoid forcing trades; wait for afternoon liquidity.";
     nextChangeAt = makeNext(7, 0, 0);
   } else {
     session = "OFF-PEAK";
     status = "WAIT";
-    note = "Low quality window. Prefer waiting for Europe/US activity.";
-    nextChangeAt = curMinutes < B_ASIA ? makeNext(7, 0, 0) : makeNext(16, 0, 0);
+    note = "Low quality window. Prefer waiting for afternoon Europe/US activity.";
+    nextChangeAt = curMinutes < B_ASIA ? makeNext(isWeekend || isMondayMorning ? 7 : 16, 0, 0) : makeNext(16, 0, 0);
   }
 
   const color = status === "TRADE" ? "#047857" : status === "SELECTIVE" ? "#111827" : "#b91c1c";
@@ -1387,6 +1398,7 @@ export default function App() {
     if (s === "EUROPE") return commit.allowEurope;
     if (s === "US") return commit.allowUS;
     if (s === "EUROPE + US OVERLAP") return commit.allowOverlap;
+    if (s === "US WEEKEND") return true;
     return commit.allowOffPeak;
   }, [commit, sessionInfo.session]);
 
@@ -3040,7 +3052,7 @@ export default function App() {
             ))}
           </div>
           <div style={{ ...subtle, marginTop: 8 }}>
-            Recommended default: <b style={{ color: "#111827" }}>Europe + Overlap + US</b>.
+            Recommended default: <b style={{ color: "#111827" }}>Afternoon onward: Europe + Overlap + US</b>. Fiji daytime is weak except weekend / Monday morning US-weekend flow.
           </div>
         </div>
       </div>
