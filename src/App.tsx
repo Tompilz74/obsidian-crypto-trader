@@ -2096,6 +2096,77 @@ export default function App() {
     });
   }, [setups, simState.history]);
 
+  const learningReview = useMemo(() => {
+    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const recent = simState.history.filter((t) => new Date(t.closedAtIso).getTime() >= cutoff);
+    const trades = recent.length ? recent : simState.history;
+    const summarize = (label: string, rows: SimClosedTrade[]) => {
+      const wins = rows.filter((t) => t.pnlUsd > 0);
+      const losses = rows.filter((t) => t.pnlUsd < 0);
+      const pnlUsd = rows.reduce((acc, t) => acc + t.pnlUsd, 0);
+      const expectancyPct = rows.length ? rows.reduce((acc, t) => acc + t.pnlPct, 0) / rows.length : 0;
+      const avgWinPct = wins.length ? wins.reduce((acc, t) => acc + t.pnlPct, 0) / wins.length : 0;
+      const avgLossPct = losses.length ? Math.abs(losses.reduce((acc, t) => acc + t.pnlPct, 0) / losses.length) : 0;
+      return { label, rows, count: rows.length, wins: wins.length, losses: losses.length, pnlUsd, winRate: rows.length ? (wins.length / rows.length) * 100 : 0, expectancyPct, avgWinPct, avgLossPct };
+    };
+
+    const normal = summarize("Normal scanner", trades.filter((t) => t.mode !== "SCALP" && !t.source.startsWith("SCALP")));
+    const scalp = summarize("Quick scalp", trades.filter((t) => t.mode === "SCALP" || t.source.startsWith("SCALP")));
+    const all = summarize(recent.length ? "Last 3 days" : "All sim data", trades);
+    const stopLosses = trades.filter((t) => t.exitReason === "STOP_LOSS");
+    const takeProfits = trades.filter((t) => t.exitReason === "TAKE_PROFIT");
+    const manualTrades = trades.filter((t) => t.exitReason === "MANUAL" || !t.exitReason);
+    const manualLosers = manualTrades.filter((t) => t.pnlUsd < 0);
+    const scoreFromSource = (source: string) => {
+      const match = source.match(/(\d+)\s*$/);
+      return match ? Number(match[1]) : undefined;
+    };
+    const winningScores = trades.map((t) => ({ t, score: scoreFromSource(t.source) })).filter((x) => x.t.pnlUsd > 0 && typeof x.score === "number") as Array<{ t: SimClosedTrade; score: number }>;
+    const losingScores = trades.map((t) => ({ t, score: scoreFromSource(t.source) })).filter((x) => x.t.pnlUsd < 0 && typeof x.score === "number") as Array<{ t: SimClosedTrade; score: number }>;
+    const avgWinningScore = winningScores.length ? winningScores.reduce((acc, x) => acc + x.score, 0) / winningScores.length : 0;
+    const avgLosingScore = losingScores.length ? losingScores.reduce((acc, x) => acc + x.score, 0) / losingScores.length : 0;
+    const suggestedMinScore = losingScores.length ? Math.max(70, Math.ceil(avgLosingScore + 5)) : 72;
+    const symbolPnl = trades.reduce<Record<string, { symbol: string; pnlUsd: number; count: number }>>((acc, t) => {
+      const row = acc[t.symbol] ?? { symbol: t.symbol, pnlUsd: 0, count: 0 };
+      row.pnlUsd += t.pnlUsd;
+      row.count += 1;
+      acc[t.symbol] = row;
+      return acc;
+    }, {});
+    const repeatLosers = Object.values(symbolPnl).filter((s) => s.count >= 2 && s.pnlUsd < 0).sort((a, b) => a.pnlUsd - b.pnlUsd).slice(0, 3);
+
+    const recommendations: string[] = [];
+    if (all.count < 6) recommendations.push("Keep trading in sim until you have at least 6-10 closed trades; current evidence is still thin.");
+    if (scalp.count >= 2 && normal.count >= 2) {
+      recommendations.push(
+        scalp.expectancyPct > normal.expectancyPct
+          ? `Quick scalp is currently outperforming normal trades by ${(scalp.expectancyPct - normal.expectancyPct).toFixed(2)}% expectancy; keep size small but prioritize SCALP TEST cards.`
+          : `Normal scanner trades are outperforming quick scalps by ${(normal.expectancyPct - scalp.expectancyPct).toFixed(2)}% expectancy; reduce scalp size or require burst score 80+.`
+      );
+    }
+    if (stopLosses.length > takeProfits.length && trades.length >= 3) recommendations.push("More stops than targets are being hit; require cleaner entry timing and avoid buying if price is already extended.");
+    if (manualLosers.length >= 2) recommendations.push("Manual exits are producing repeated losers; use the stop/target auto-exit more and avoid manually holding through invalidation.");
+    if (repeatLosers.length) recommendations.push(`Temporary blacklist: ${repeatLosers.map((s) => s.symbol).join(", ")} until they produce a clean scanner setup again.`);
+    if (losingScores.length >= 2 && avgLosingScore >= 70) recommendations.push(`Raise minimum score toward ${suggestedMinScore}+ because losing trades are still coming from decent-looking scores.`);
+    if (signalCalibration.resolved.length >= 5 && signalCalibration.confidenceGap > 10) recommendations.push("AI confidence has been too optimistic versus resolved outcomes; keep the current confidence haircut and demand more confirmation.");
+    if (!recommendations.length) recommendations.push("No strong negative pattern yet. Keep collecting sim trades and avoid changing too many rules at once.");
+
+    return {
+      sampleLabel: recent.length ? "last 3 days" : "all saved sim trades",
+      all,
+      normal,
+      scalp,
+      stopLosses: stopLosses.length,
+      takeProfits: takeProfits.length,
+      manualLosers: manualLosers.length,
+      avgWinningScore,
+      avgLosingScore,
+      suggestedMinScore,
+      repeatLosers,
+      recommendations,
+    };
+  }, [signalCalibration.confidenceGap, signalCalibration.resolved.length, simState.history]);
+
   const accuracyScore = useMemo(() => {
     const simScore = simState.history.length ? clamp(50 + simStats.expectancyPct * 9 + (simStats.winRate - 50) * 0.45, 0, 100) : 45;
     const replayScore = scannerReplay.trades.length ? clamp(50 + scannerReplay.expectancyPct * 11 + (scannerReplay.winRate - 50) * 0.35, 0, 100) : 42;
@@ -4990,6 +5061,76 @@ export default function App() {
               <div style={{ ...subtle, marginTop: 8 }}>{copy}</div>
             </div>
           ))}
+        </div>
+      </div>
+
+      <div style={{ ...panel, marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={sectionTitle}>LEARNING REVIEW</div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              Uses {learningReview.sampleLabel} to suggest rule changes from your actual simulator outcomes.
+            </div>
+          </div>
+          <span style={{ ...pill, color: learningReview.all.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
+            Expectancy {learningReview.all.expectancyPct >= 0 ? "+" : ""}
+            {learningReview.all.expectancyPct.toFixed(2)}%
+          </span>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 10, marginTop: 14 }}>
+          <div style={statCard}>
+            <div style={subtle}>Sample</div>
+            <div style={{ fontWeight: 950 }}>{learningReview.all.count} trades</div>
+            <div style={{ ...subtle, marginTop: 6 }}>{learningReview.all.winRate.toFixed(0)}% win rate</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Normal</div>
+            <div style={{ fontWeight: 950, color: learningReview.normal.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
+              {learningReview.normal.count ? `${learningReview.normal.expectancyPct >= 0 ? "+" : ""}${learningReview.normal.expectancyPct.toFixed(2)}%` : "No data"}
+            </div>
+            <div style={{ ...subtle, marginTop: 6 }}>{learningReview.normal.count} trades</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Quick scalp</div>
+            <div style={{ fontWeight: 950, color: learningReview.scalp.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
+              {learningReview.scalp.count ? `${learningReview.scalp.expectancyPct >= 0 ? "+" : ""}${learningReview.scalp.expectancyPct.toFixed(2)}%` : "No data"}
+            </div>
+            <div style={{ ...subtle, marginTop: 6 }}>{learningReview.scalp.count} trades</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Exit quality</div>
+            <div style={{ fontWeight: 950 }}>{learningReview.takeProfits} TP / {learningReview.stopLosses} SL</div>
+            <div style={{ ...subtle, marginTop: 6 }}>{learningReview.manualLosers} manual losers</div>
+          </div>
+          <div style={statCard}>
+            <div style={subtle}>Suggested score floor</div>
+            <div style={{ fontWeight: 950 }}>{learningReview.suggestedMinScore}+</div>
+            <div style={{ ...subtle, marginTop: 6 }}>
+              Wins avg {learningReview.avgWinningScore ? learningReview.avgWinningScore.toFixed(0) : "-"} · losses avg {learningReview.avgLosingScore ? learningReview.avgLosingScore.toFixed(0) : "-"}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 14, marginTop: 14 }}>
+          <div style={{ display: "grid", gap: 8 }}>
+            {learningReview.recommendations.map((rec) => (
+              <div key={rec} style={{ ...statCard, background: "#ffffff" }}>
+                <div style={{ fontWeight: 900, color: "#111827" }}>{rec}</div>
+              </div>
+            ))}
+          </div>
+          <div style={proPanel}>
+            <div style={{ fontWeight: 950, color: "#111827" }}>Next rule tweak</div>
+            <div style={{ ...subtle, marginTop: 8 }}>
+              Run the next 5-10 simulator trades using these recommendations, then compare the Learning Review again. Only promote a rule to real-money use after it improves expectancy, not just win rate.
+            </div>
+            {learningReview.repeatLosers.length > 0 && (
+              <div style={{ ...subtle, marginTop: 10 }}>
+                Weak repeat coins: {learningReview.repeatLosers.map((s) => `${s.symbol} ${fmtUsd(s.pnlUsd)}`).join(" · ")}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
