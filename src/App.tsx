@@ -634,7 +634,7 @@ function strategyFromGoal(targetReturnPct: number, targetPeriod: GoalPeriod): {
       maxOpenPositions: 1,
       riskPerTradePct: 0.75,
       minConfidence: 82,
-      notes: "Aggressive target. Use only the cleanest scanner setups, take smaller size, and stop quickly if the first trades fail.",
+      notes: "Aggressive awake-only scalp target. Trade only while watching the screen, use the cleanest scanner setups, keep size small, and close stale trades before they become overnight holds.",
     };
   }
 
@@ -647,7 +647,7 @@ function strategyFromGoal(targetReturnPct: number, targetPeriod: GoalPeriod): {
       maxOpenPositions: 2,
       riskPerTradePct: 1,
       minConfidence: 76,
-      notes: "Active day-trading target. Focus on VALID timing, Structure OK, and avoid adding after a losing entry.",
+      notes: "Active day-trading target. Focus on VALID timing, Structure OK, and close positions before sleep unless they are deliberately moved into the long-term study lane.",
     };
   }
 
@@ -1190,7 +1190,7 @@ export default function App() {
   const [goalPlanInputText, setGoalPlanInputText] = useState<Record<GoalPlanNumberKey, string>>(() => goalPlanNumberText(goalPlanDraft));
   const [goalRiskAccepted, setGoalRiskAccepted] = useState(false);
   const [simSymbol, setSimSymbol] = useState("SOL");
-  const [simTradeMode, setSimTradeMode] = useState<SimTradeMode>("NORMAL");
+  const [simTradeMode, setSimTradeMode] = useState<SimTradeMode>("SCALP");
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simBuyUsd, setSimBuyUsd] = useState("250");
   const [simStopLossInput, setSimStopLossInput] = useState("");
@@ -1645,7 +1645,7 @@ export default function App() {
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
         const speedLabel = hasMicro ? (rollingOver ? "FADING" : earlyBurst ? "EARLY BURST" : continuationOk ? "ACCELERATING" : "WATCHING") : "NEEDS MICRO";
         const legsLabel = peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 70 && continuationOk ? "HAS LEGS" : legsScore >= 50 && !rollingOver ? "MAYBE LEGS" : "NO LEGS";
-        const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "5 to 25 minutes. Take profit fast or trail manually." : "5 to 45 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
+        const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "2 to 12 minutes. Take profit fast or trail manually." : "3 to 20 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
           `Burst score ${burstScore}/100`,
@@ -1703,6 +1703,14 @@ export default function App() {
   const simChallengeDay = Math.min(7, Math.floor(simElapsedDays) + 1);
   const simDaysLeft = Math.max(0, 7 - simElapsedDays);
   const simSelectedHolding = simState.positions.find((p) => p.symbol === simSymbol);
+  const simScalpPositions = useMemo(
+    () => simState.positions.filter((p) => p.mode === "SCALP" || p.source.startsWith("SCALP")),
+    [simState.positions]
+  );
+  const simLongStudyPositions = useMemo(
+    () => simState.positions.filter((p) => p.mode !== "SCALP" && !p.source.startsWith("SCALP")),
+    [simState.positions]
+  );
   const simSelectedHoldingPnl = simSelectedHolding
     ? ((getSimPrice(simSelectedHolding.symbol) || simSelectedHolding.entry) - simSelectedHolding.entry) * simSelectedHolding.qty
     : 0;
@@ -2069,6 +2077,7 @@ export default function App() {
       const weakSetup = !setup || setup.entryQuality === "NO_EDGE" || setup.structureLabel === "NO_EDGE";
       const hitStop = typeof p.stop === "number" && now <= p.stop;
       const hitTarget = typeof p.takeProfit === "number" && now >= p.takeProfit;
+      const isScalp = p.mode === "SCALP" || p.source.startsWith("SCALP");
       const canAdd =
         strict &&
         pnlPct > 0.35 &&
@@ -2080,7 +2089,11 @@ export default function App() {
       let tone = "#111827";
       const reasons: string[] = [];
 
-      if (hitStop) {
+      if (isScalp && ageHours >= 0.5 && pnlPct < 0.5) {
+        action = "SELL";
+        tone = "#b91c1c";
+        reasons.push("Scalp has gone stale; close it while you are awake instead of letting it become a hold.");
+      } else if (hitStop) {
         action = "SELL";
         tone = "#b91c1c";
         reasons.push("Price has reached or lost the planned stop.");
@@ -2104,7 +2117,8 @@ export default function App() {
         reasons.push(strict ? "Hold while scanner remains VALID + Structure OK." : "Hold only if your original thesis is still intact.");
       }
 
-      if (ageHours >= 8 && pnlPct < 1) reasons.push("Long hold with weak progress; consider freeing capital.");
+      if (isScalp && ageHours >= 0.25) reasons.push("Scalp review timer active: either target, stop, or close manually.");
+      if (!isScalp && ageHours >= 8 && pnlPct < 1) reasons.push("Long-term study hold with weak progress; consider freeing capital.");
       if (simState.positions.length >= 3) reasons.push("Portfolio already has max open holdings; no adding.");
       if (drawdownPct <= -1.5) reasons.push("Account drawdown guard is active; no adding.");
       if (bestAlternative && (!setup || bestAlternative.combinedScore - setup.combinedScore >= 12) && pnlPct < 1.25) {
@@ -2201,7 +2215,7 @@ export default function App() {
       return { label, rows, count: rows.length, wins: wins.length, losses: losses.length, pnlUsd, winRate: rows.length ? (wins.length / rows.length) * 100 : 0, expectancyPct, avgWinPct, avgLossPct };
     };
 
-    const normal = summarize("Normal scanner", trades.filter((t) => t.mode !== "SCALP" && !t.source.startsWith("SCALP")));
+    const normal = summarize("Long-term study", trades.filter((t) => t.mode !== "SCALP" && !t.source.startsWith("SCALP")));
     const scalp = summarize("Quick scalp", trades.filter((t) => t.mode === "SCALP" || t.source.startsWith("SCALP")));
     const all = summarize(recent.length ? "Last 3 days" : "All sim data", trades);
     const stopLosses = trades.filter((t) => t.exitReason === "STOP_LOSS");
@@ -2231,8 +2245,8 @@ export default function App() {
     if (scalp.count >= 2 && normal.count >= 2) {
       recommendations.push(
         scalp.expectancyPct > normal.expectancyPct
-          ? `Quick scalp is currently outperforming normal trades by ${(scalp.expectancyPct - normal.expectancyPct).toFixed(2)}% expectancy; keep size small but prioritize SCALP TEST cards.`
-          : `Normal scanner trades are outperforming quick scalps by ${(normal.expectancyPct - scalp.expectancyPct).toFixed(2)}% expectancy; reduce scalp size or require burst score 80+.`
+          ? `Quick scalp is currently outperforming long-term study trades by ${(scalp.expectancyPct - normal.expectancyPct).toFixed(2)}% expectancy; keep size small but prioritize SCALP TEST cards.`
+          : `Long-term study trades are outperforming quick scalps by ${(normal.expectancyPct - scalp.expectancyPct).toFixed(2)}% expectancy; reduce scalp size or require burst score 80+.`
       );
     }
     if (stopLosses.length > takeProfits.length && trades.length >= 3) recommendations.push("More stops than targets are being hit; require cleaner entry timing and avoid buying if price is already extended.");
@@ -4333,15 +4347,15 @@ export default function App() {
         <div style={{ ...proPanel, marginTop: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             <div>
-              <div style={sectionTitle}>PORTFOLIO</div>
+              <div style={sectionTitle}>SHORT-TERM / LONG-TERM HOLDINGS</div>
               <div style={{ ...subtle, marginTop: 6 }}>
                 {simState.positions.length
-                  ? `${simState.positions.length} open holding${simState.positions.length === 1 ? "" : "s"} ready to sell below.`
-                  : "Nothing bought yet. Choose a coin and buy to start building the sim portfolio."}
+                  ? `${simScalpPositions.length} scalp holding${simScalpPositions.length === 1 ? "" : "s"} · ${simLongStudyPositions.length} long-term study holding${simLongStudyPositions.length === 1 ? "" : "s"}.`
+                  : "Nothing bought yet. Short-term scalps stay separate from long-term study ideas."}
               </div>
             </div>
             <span style={{ ...pill, color: simState.positions.length ? "#047857" : "#111827" }}>
-              Holdings: {simState.positions.length}
+              Scalp {simScalpPositions.length} / Study {simLongStudyPositions.length}
             </span>
           </div>
         </div>
@@ -4526,17 +4540,17 @@ export default function App() {
       <div style={{ ...panel, marginTop: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
-            <div style={sectionTitle}>QUICK SCALP / MOMENTUM BURST</div>
+            <div style={sectionTitle}>SHORT-TERM SCALP / MOMENTUM BURST</div>
             <div style={{ ...subtle, marginTop: 6 }}>
-              Fast-move simulator mode for short holds only. It looks for momentum plus volume, then blocks late chases.
+              Main trading lane: awake-only, short holds, mandatory stop/target, and no overnight drift.
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button style={simTradeMode === "NORMAL" ? btnDanger : btn} onClick={() => setSimTradeMode("NORMAL")}>
-              Normal Scanner
+              Long-Term Study
             </button>
             <button style={simTradeMode === "SCALP" ? btnDanger : btn} onClick={() => setSimTradeMode("SCALP")}>
-              Quick Scalp
+              Short-Term Scalp
             </button>
           </div>
         </div>
@@ -4625,7 +4639,7 @@ export default function App() {
         </div>
 
         <div style={{ ...subtle, marginTop: 10 }}>
-          Scalp rules: smaller size, mandatory stop, mandatory target, and exit fast. If the card says TOO LATE, the simulator warns you hard instead of blocking the buy.
+          Scalp rules: smaller size, mandatory stop, mandatory target, and exit fast while you are awake. If a scalp is still open later, treat it as stale unless the setup clearly re-accelerates.
         </div>
       </div>
 
@@ -4635,11 +4649,11 @@ export default function App() {
             <div>
               <div style={sectionTitle}>BUY TICKET</div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                {simTradeMode === "SCALP" ? "Quick scalp ticket: small size, fast exit, no late chases." : "Selected coin and scanner read before you buy."}
+                {simTradeMode === "SCALP" ? "Short-term scalp ticket: small size, fast exit, no late chases, no overnight holds." : "Long-term study ticket: research the idea separately from your scalp lane."}
               </div>
             </div>
             <span style={{ ...pill, color: simTradeMode === "SCALP" ? "#b91c1c" : "#047857" }}>
-              {simTradeMode === "SCALP" ? "QUICK SCALP" : "NORMAL"}
+              {simTradeMode === "SCALP" ? "SHORT-TERM SCALP" : "LONG-TERM STUDY"}
             </span>
           </div>
 
@@ -4968,7 +4982,19 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {simState.positions.map((p) => {
+                  {[
+                    { label: "Short-term scalps", rows: simScalpPositions, note: "Awake-only trades. Close fast; do not let these turn into overnight holds." },
+                    { label: "Long-term study", rows: simLongStudyPositions, note: "Research lane only. Use this to learn, not as the default trading style." },
+                  ].map((group) =>
+                    group.rows.length ? (
+                      <React.Fragment key={group.label}>
+                        <tr>
+                          <td colSpan={11} style={{ padding: "8px", background: "#ffffff" }}>
+                            <div style={{ fontWeight: 950, color: group.label === "Short-term scalps" ? "#b91c1c" : "#0f766e" }}>{group.label}</div>
+                            <div style={{ ...subtle, marginTop: 4 }}>{group.note}</div>
+                          </td>
+                        </tr>
+                        {group.rows.map((p) => {
                     const now = getSimPrice(p.symbol) || p.entry;
                     const value = now * p.qty;
                     const pnl = (now - p.entry) * p.qty;
@@ -5095,6 +5121,9 @@ export default function App() {
                       </tr>
                     );
                   })}
+                      </React.Fragment>
+                    ) : null
+                  )}
                 </tbody>
               </table>
             )}
@@ -5208,7 +5237,7 @@ export default function App() {
             <div style={{ ...subtle, marginTop: 6 }}>{learningReview.all.winRate.toFixed(0)}% win rate</div>
           </div>
           <div style={statCard}>
-            <div style={subtle}>Normal</div>
+            <div style={subtle}>Long-term study</div>
             <div style={{ fontWeight: 950, color: learningReview.normal.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
               {learningReview.normal.count ? `${learningReview.normal.expectancyPct >= 0 ? "+" : ""}${learningReview.normal.expectancyPct.toFixed(2)}%` : "No data"}
             </div>
