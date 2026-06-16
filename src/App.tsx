@@ -24,6 +24,9 @@ type SessionStatus = "TRADE" | "SELECTIVE" | "WAIT";
 type TradeSide = "LONG" | "SHORT";
 type SimTradeMode = "NORMAL" | "SCALP";
 
+const MARKET_REFRESH_MS = 90 * 1000;
+const MARKET_REFRESH_LABEL = "90s";
+
 type MarketRow = {
   symbol: string;
   cgId?: string;
@@ -1371,7 +1374,7 @@ export default function App() {
 
   useInterval(() => {
     if (autoRefresh) refresh();
-  }, autoRefresh ? 5 * 60 * 1000 : null);
+  }, autoRefresh ? MARKET_REFRESH_MS : null);
 
   const commitRequired = !commit || commit.dayKey !== todayKey;
 
@@ -3400,7 +3403,7 @@ export default function App() {
             <input style={input} placeholder="Search coins (symbol or name)…" value={query} onChange={(e) => setQuery(e.target.value)} />
             <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#64748b", fontWeight: 800 }}>
               <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
-              Auto (5m)
+              Auto ({MARKET_REFRESH_LABEL})
             </label>
           </div>
 
