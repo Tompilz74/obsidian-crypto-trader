@@ -262,6 +262,19 @@ type MicroMetrics = {
 type MicroMap = Record<string, MicroMetrics>;
 type PriceHistoryMap = Record<string, number[]>;
 
+type PathMomentum = {
+  path1h: number;
+  path4h: number;
+  path8h: number;
+  path24h: number;
+  slopeLift: number;
+  greenRatio: number;
+  pullbackPct: number;
+  stairScore: number;
+  verticalRisk: number;
+  label: string;
+};
+
 type AlertSettings = {
   enabled: boolean;
   minFastMovePct: number;
@@ -361,6 +374,67 @@ function recentPathPct(prices: number[], pointsBack: number) {
   const from = clean[Math.max(0, clean.length - 1 - pointsBack)];
   const last = clean[clean.length - 1];
   return from > 0 ? ((last - from) / from) * 100 : 0;
+}
+
+function computePathMomentum(prices: number[]): PathMomentum {
+  const clean = prices.filter((p) => typeof p === "number" && isFinite(p) && p > 0);
+  if (clean.length < 2) {
+    return {
+      path1h: 0,
+      path4h: 0,
+      path8h: 0,
+      path24h: 0,
+      slopeLift: 0,
+      greenRatio: 0,
+      pullbackPct: 0,
+      stairScore: 0,
+      verticalRisk: 0,
+      label: "NO PATH",
+    };
+  }
+
+  const path1h = recentPathPct(clean, 1);
+  const path4h = recentPathPct(clean, 4);
+  const path8h = recentPathPct(clean, 8);
+  const path24h = recentPathPct(clean, Math.min(24, clean.length - 1));
+  const recent = clean.slice(Math.max(1, clean.length - 13));
+  const deltas = recent.map((price, i) => (i === 0 ? 0 : price - recent[i - 1])).slice(1);
+  const greenRatio = deltas.length ? deltas.filter((d) => d > 0).length / deltas.length : 0;
+  const high12 = Math.max(...clean.slice(Math.max(0, clean.length - 12)));
+  const last = clean[clean.length - 1];
+  const pullbackPct = high12 > 0 ? ((last - high12) / high12) * 100 : 0;
+  const prior4hPace = Math.max(0, path8h - path4h) / 4;
+  const current4hPace = Math.max(0, path4h) / 4;
+  const slopeLift = current4hPace - prior4hPace;
+  const stairScore = Math.round(clamp(
+    40 +
+      Math.max(0, path4h) * 5 +
+      Math.max(0, path8h) * 2.2 +
+      Math.max(0, slopeLift) * 18 +
+      greenRatio * 22 +
+      Math.max(-10, pullbackPct) * 1.4,
+    0,
+    100
+  ));
+  const verticalRisk = Math.round(clamp(
+    Math.max(0, path1h - 2.8) * 14 +
+      Math.max(0, path4h - 9) * 6 +
+      Math.max(0, path24h - 28) * 1.8 +
+      (greenRatio > 0.82 ? 10 : 0) +
+      (pullbackPct > -0.35 ? 8 : 0),
+    0,
+    100
+  ));
+  const label =
+    verticalRisk >= 65
+      ? "VERTICAL"
+      : stairScore >= 76 && slopeLift > 0.15
+        ? "LIFTING"
+        : stairScore >= 62
+          ? "BUILDING"
+          : "FLAT";
+
+  return { path1h, path4h, path8h, path24h, slopeLift, greenRatio, pullbackPct, stairScore, verticalRisk, label };
 }
 
 function useInterval(callback: () => void, delayMs: number | null) {
@@ -1389,12 +1463,14 @@ export default function App() {
           const vol = m.volume24hUsd ?? 0;
           const volFactor = baselineVolTemp > 0 ? vol / baselineVolTemp : 1;
           const ch = m.change24h ?? 0;
-          const scalpPriority = Math.max(0, ch) * 7 + Math.log10(Math.max(1, volFactor)) * 28;
+          const positiveTape = Math.max(0, ch);
+          const earlyTape = ch > -1 ? 8 : 0;
+          const scalpPriority = positiveTape * 7.5 + Math.log10(Math.max(1, volFactor)) * 32 + earlyTape;
           return { symbol: m.symbol, cgId: m.cgId, scalpPriority };
         })
-        .filter((x) => !!x.cgId && x.scalpPriority > 8)
+        .filter((x) => !!x.cgId && x.scalpPriority > 7)
         .sort((a, b) => b.scalpPriority - a.scalpPriority)
-        .slice(0, 14);
+        .slice(0, 34);
 
       // ---- Phase 2B: micro entry-quality (CoinGecko hourly)
       try {
@@ -1418,7 +1494,7 @@ export default function App() {
 
       // ---- Quick scalp micro refresh: prioritize fresh 1h/4h acceleration for fast movers
       try {
-        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 8);
+        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 22);
         const scalpPairs = await Promise.all(
           scalpTargets.map(async (x) => {
             const prices = await fetchCoinGeckoHourly24h(x.cgId!);
@@ -1734,21 +1810,38 @@ export default function App() {
         const hasMicro = typeof s.ret1h === "number" && typeof s.ret4h === "number";
         const fastMove = typeof s.ret1h === "number" ? s.ret1h : ch24 * 0.16;
         const move4h = typeof s.ret4h === "number" ? s.ret4h : ch24 * 0.38;
+        const path = computePathMomentum(priceHistoryMap[s.symbol] ?? []);
+        const pathAware = path.stairScore > 0;
+        const stairLaunch = path.stairScore >= 70 && path.slopeLift > 0.08 && path.path4h >= 1.4 && path.pullbackPct > -2.4;
+        const pathBreakout = path.path1h >= 1.25 && path.path4h >= 2.2 && path.slopeLift > 0.18 && path.verticalRisk < 72;
+        const pathStillHasLegs = stairLaunch && path.verticalRisk < 62 && path.greenRatio >= 0.52;
         const acceleration = fastMove - move4h / 4;
         const volumeScore = clamp(Math.log10(Math.max(1, s.volFactor)) * 36 + 42, 0, 100);
-        const momentumScore = clamp(42 + fastMove * 17 + acceleration * 14 + Math.max(0, move4h) * 3 + Math.max(0, ch24) * 0.9, 0, 100);
+        const momentumScore = clamp(
+          42 +
+            fastMove * 17 +
+            acceleration * 14 +
+            Math.max(0, move4h) * 3 +
+            Math.max(0, ch24) * 0.9 +
+            (pathAware ? path.stairScore * 0.18 + Math.max(0, path.path4h) * 2.4 : 0),
+          0,
+          100
+        );
         const liquidityOk = s.volFactor >= 1.15 && price > 0;
         const spike6h = s.spikeFromLow6h ?? Math.max(0, move4h);
         const dropFromHigh = s.dropFromHigh6h ?? 0;
         const latestWeak = hasMicro && fastMove <= 0;
         const stalling = hasMicro && fastMove < 0.18 && acceleration <= 0.28;
-        const rollingOver = latestWeak || (dropFromHigh <= -1.2 && acceleration <= 0.28) || (spike6h >= 5 && stalling);
-        const continuationOk = hasMicro && fastMove > 0.18 && acceleration > 0.05 && dropFromHigh > -1.8;
+        const rollingOver = latestWeak || (dropFromHigh <= -1.2 && acceleration <= 0.28 && !pathStillHasLegs) || (spike6h >= 5 && stalling && !stairLaunch);
+        const continuationOk = (hasMicro && fastMove > 0.18 && acceleration > 0.05 && dropFromHigh > -1.8) || pathBreakout || pathStillHasLegs;
         const peakRiskScore = Math.round(clamp(
           spike6h * 6 +
             Math.max(0, ch24 - 12) * 3 +
             Math.max(0, -acceleration) * 18 +
             Math.max(0, -dropFromHigh - 1.5) * 8 +
+            path.verticalRisk * 0.35 -
+            (pathStillHasLegs ? 22 : 0) -
+            (stairLaunch ? 10 : 0) +
             (rollingOver ? 30 : 0) +
             (latestWeak ? 18 : 0),
           0,
@@ -1758,7 +1851,8 @@ export default function App() {
           58 +
             acceleration * 18 +
             Math.max(0, fastMove) * 8 +
-            Math.max(0, move4h) * 2 -
+            Math.max(0, move4h) * 2 +
+            (pathAware ? path.stairScore * 0.24 + Math.max(0, path.slopeLift) * 12 - path.verticalRisk * 0.16 : 0) -
             peakRiskScore * 0.55 +
             (liquidityOk ? 8 : -10) -
             (rollingOver ? 24 : 0) -
@@ -1766,14 +1860,15 @@ export default function App() {
           0,
           100
         ));
-        const peakRisk = peakRiskScore >= 58 || (spike6h >= 8 && acceleration <= 0.15);
-        const tooLate = peakRisk || rollingOver || (s.spikeFromLow6h ?? 0) >= 11 || (fastMove >= 4.2 && acceleration <= 0) || ch24 >= 24;
+        const peakRisk = peakRiskScore >= 62 || (spike6h >= 8 && acceleration <= 0.15 && !pathStillHasLegs) || path.verticalRisk >= 78;
+        const tooLate = peakRisk || rollingOver || ((s.spikeFromLow6h ?? 0) >= 13 && !pathStillHasLegs) || (fastMove >= 4.2 && acceleration <= 0) || (ch24 >= 34 && path.verticalRisk >= 62);
         const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || fastMove <= -1.4 || ch24 <= -5;
-        const earlyBurst = hasMicro && !rollingOver && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 8 && legsScore >= 55;
-        const warming = hasMicro && !rollingOver && fastMove >= 0.1 && acceleration > 0 && move4h > 0;
+        const earlyBurst = !rollingOver && legsScore >= 55 && ((hasMicro && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 9) || pathBreakout);
+        const warming = !rollingOver && ((hasMicro && fastMove >= 0.1 && acceleration > 0 && move4h > 0) || stairLaunch);
         const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
         const freshnessBonus = hasMicro ? 10 : -8;
-        const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
+        const pathBonus = pathAware ? (path.label === "LIFTING" ? 16 : path.label === "BUILDING" ? 9 : path.label === "VERTICAL" ? -10 : 0) : 0;
+        const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + pathBonus + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
         const targetPct = clamp(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), 0.85, 3.4);
         const stop = price ? price * (1 - stopPct / 100) : 0;
@@ -1788,11 +1883,14 @@ export default function App() {
           `Burst score ${burstScore}/100`,
           hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
           `Accel ${acceleration >= 0 ? "+" : ""}${acceleration.toFixed(2)}`,
+          pathAware ? `Path ${path.label} ${path.stairScore}/100` : "Path loading",
           `Legs ${legsScore}/100`,
           `Volume ${s.volFactor.toFixed(2)}x baseline`,
         ];
         const warnings: string[] = [];
         if (!hasMicro) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
+        if (path.label === "VERTICAL") warnings.push("Chart has gone vertical; do not chase without pullback/reclaim.");
+        if (stairLaunch && !tooLate) warnings.push("Stair-step momentum detected; watch for a controlled entry before the next vertical push.");
         if (latestWeak) warnings.push("Latest 1h is red; wait for reclaim before entering.");
         if (rollingOver && !latestWeak) warnings.push("Rolling over from recent high; do not buy the first red turn.");
         if (peakRisk) warnings.push(`Peak risk: +${spike6h.toFixed(2)}% from 6h low with limited fresh acceleration.`);
@@ -1804,8 +1902,8 @@ export default function App() {
       })
       .filter((s) => s.price > 0)
       .sort((a, b) => b.burstScore - a.burstScore)
-      .slice(0, 12);
-  }, [getSimPrice, setups, simState.cashUsd]);
+      .slice(0, 20);
+  }, [getSimPrice, priceHistoryMap, setups, simState.cashUsd]);
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
   const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
   const scalpSignalBySymbol = useMemo(() => new Map(scalpSignals.map((s) => [s.symbol, s])), [scalpSignals]);
