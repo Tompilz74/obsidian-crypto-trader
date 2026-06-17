@@ -260,6 +260,7 @@ type MicroMetrics = {
 };
 
 type MicroMap = Record<string, MicroMetrics>;
+type PriceHistoryMap = Record<string, number[]>;
 
 // ===== Phase 3 types =====
 type StructureLabel = "OK" | "WAIT" | "NO_EDGE";
@@ -289,6 +290,51 @@ const confidencePct = (n?: number) => {
   if (typeof n !== "number" || !isFinite(n)) return 0;
   return Math.round(clamp(n <= 1 ? n * 100 : n, 0, 100));
 };
+
+function CoinPerformanceChart({ prices }: { prices: number[] }) {
+  const clean = prices.filter((p) => typeof p === "number" && isFinite(p) && p > 0);
+  if (clean.length < 2) {
+    return (
+      <div style={{ height: 180, display: "grid", placeItems: "center", color: "#64748b", fontWeight: 800 }}>
+        Chart loading with next market refresh.
+      </div>
+    );
+  }
+
+  const width = 720;
+  const height = 180;
+  const pad = 10;
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  const range = Math.max(max - min, max * 0.001);
+  const points = clean.map((price, i) => {
+    const x = pad + (i / Math.max(1, clean.length - 1)) * (width - pad * 2);
+    const y = height - pad - ((price - min) / range) * (height - pad * 2);
+    return [x, y] as const;
+  });
+  const line = points.map(([x, y], i) => `${i ? "L" : "M"} ${x.toFixed(2)} ${y.toFixed(2)}`).join(" ");
+  const fill = `${line} L ${width - pad} ${height - pad} L ${pad} ${height - pad} Z`;
+  const changePct = ((clean[clean.length - 1] - clean[0]) / clean[0]) * 100;
+  const stroke = changePct >= 0 ? "#059669" : "#dc2626";
+
+  return (
+    <div>
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="24 hour coin price chart" style={{ width: "100%", height, display: "block" }}>
+        {[0.25, 0.5, 0.75].map((level) => (
+          <line key={level} x1={pad} x2={width - pad} y1={height * level} y2={height * level} stroke="#e2e8f0" strokeWidth="1" />
+        ))}
+        <path d={fill} fill={changePct >= 0 ? "rgba(16,185,129,0.12)" : "rgba(220,38,38,0.10)"} />
+        <path d={line} fill="none" stroke={stroke} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <circle cx={points[points.length - 1][0]} cy={points[points.length - 1][1]} r="4" fill={stroke} />
+      </svg>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, color: "#64748b", fontSize: "0.78rem", fontWeight: 800 }}>
+        <span>24h low {fmtUsd(min)}</span>
+        <span style={{ color: stroke }}>24h path {changePct >= 0 ? "+" : ""}{fmtPct(changePct)}</span>
+        <span>24h high {fmtUsd(max)}</span>
+      </div>
+    </div>
+  );
+}
 
 function useInterval(callback: () => void, delayMs: number | null) {
   const savedRef = useRef(callback);
@@ -1168,6 +1214,7 @@ export default function App() {
 
   const [market, setMarket] = useState<MarketRow[]>([]);
   const [microMap, setMicroMap] = useState<MicroMap>({});
+  const [priceHistoryMap, setPriceHistoryMap] = useState<PriceHistoryMap>({});
   const [structMap, setStructMap] = useState<Record<string, StructureResult>>({});
 
   const [focusSymbol, setFocusSymbol] = useState<string>("SOL");
@@ -1296,12 +1343,17 @@ export default function App() {
         const pairs = await Promise.all(
           rankedTemp.map(async (x) => {
             const prices = await fetchCoinGeckoHourly24h(x.cgId!);
-            return [x.symbol, computeMicro(prices)] as const;
+            return [x.symbol, computeMicro(prices), prices] as const;
           })
         );
         const next: MicroMap = {};
-        for (const [sym, metrics] of pairs) next[sym] = metrics;
+        const nextHistory: PriceHistoryMap = {};
+        for (const [sym, metrics, prices] of pairs) {
+          next[sym] = metrics;
+          nextHistory[sym] = prices;
+        }
         setMicroMap((prev) => ({ ...prev, ...next }));
+        setPriceHistoryMap((prev) => ({ ...prev, ...nextHistory }));
       } catch {
         // keep previous microMap if chart calls fail
       }
@@ -1312,12 +1364,17 @@ export default function App() {
         const scalpPairs = await Promise.all(
           scalpTargets.map(async (x) => {
             const prices = await fetchCoinGeckoHourly24h(x.cgId!);
-            return [x.symbol, computeMicro(prices)] as const;
+            return [x.symbol, computeMicro(prices), prices] as const;
           })
         );
         const next: MicroMap = {};
-        for (const [sym, metrics] of scalpPairs) next[sym] = metrics;
+        const nextHistory: PriceHistoryMap = {};
+        for (const [sym, metrics, prices] of scalpPairs) {
+          next[sym] = metrics;
+          nextHistory[sym] = prices;
+        }
         setMicroMap((prev) => ({ ...prev, ...next }));
+        setPriceHistoryMap((prev) => ({ ...prev, ...nextHistory }));
       } catch {
         // keep previous scalp micro data if chart calls fail
       }
@@ -1375,6 +1432,27 @@ export default function App() {
   useInterval(() => {
     if (autoRefresh) refresh();
   }, autoRefresh ? MARKET_REFRESH_MS : null);
+
+  useEffect(() => {
+    if (!simSymbol || priceHistoryMap[simSymbol]?.length) return;
+    const coin = COINS.find((c) => c.symbol.toUpperCase() === simSymbol);
+    if (!coin?.cgId) return;
+
+    let cancelled = false;
+    fetchCoinGeckoHourly24h(coin.cgId)
+      .then((prices) => {
+        if (cancelled || prices.length < 2) return;
+        setPriceHistoryMap((prev) => ({ ...prev, [simSymbol]: prices }));
+        setMicroMap((prev) => ({ ...prev, [simSymbol]: computeMicro(prices) }));
+      })
+      .catch(() => {
+        // Chart is opportunistic; keep the rest of the simulator usable if this call fails.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [priceHistoryMap, simSymbol]);
 
   const commitRequired = !commit || commit.dayKey !== todayKey;
 
@@ -1581,6 +1659,7 @@ export default function App() {
 
   const simSelectedSetup = setups.find((s) => s.symbol === simSymbol);
   const simulatorPrice = getSimPrice(simSymbol) || simSelectedSetup?.priceUsd || 0;
+  const selectedPriceHistory = priceHistoryMap[simSymbol] ?? [];
   const simCanBuySelected = simulatorPrice > 0 && isFinite(simulatorPrice);
   const simStopLoss = Number(simStopLossInput);
   const simTakeProfit = Number(simTakeProfitInput);
@@ -4666,6 +4745,21 @@ export default function App() {
                 </div>
               </div>
               <ScorePill score={simSelectedSetup?.combinedScore ?? 0} />
+            </div>
+
+            <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 950, color: "#111827" }}>24h Performance</div>
+                  <div style={{ ...subtle, marginTop: 3 }}>Hourly path from CoinGecko for the inspected coin.</div>
+                </div>
+                <span style={{ ...pill, color: selectedPriceHistory.length >= 2 ? "#047857" : "#92400e" }}>
+                  {selectedPriceHistory.length >= 2 ? `${selectedPriceHistory.length} points` : "Loading"}
+                </span>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <CoinPerformanceChart prices={selectedPriceHistory} />
+              </div>
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
