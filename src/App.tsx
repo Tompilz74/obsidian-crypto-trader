@@ -19,7 +19,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
  * ✅ Clear labels (STRUCTURE: OK / WAIT / NO EDGE)
  */
 
-type TabKey = "dashboard" | "scanner" | "journal" | "history" | "plan" | "simulator" | "accuracy" | "pro";
+type TabKey = "dashboard" | "scanner" | "journal" | "history" | "plan" | "simulator" | "alerts" | "accuracy" | "pro";
 type SessionStatus = "TRADE" | "SELECTIVE" | "WAIT";
 type TradeSide = "LONG" | "SHORT";
 type SimTradeMode = "NORMAL" | "SCALP";
@@ -262,6 +262,25 @@ type MicroMetrics = {
 type MicroMap = Record<string, MicroMetrics>;
 type PriceHistoryMap = Record<string, number[]>;
 
+type AlertSettings = {
+  enabled: boolean;
+  minFastMovePct: number;
+  minBuildMovePct: number;
+  minBurstScore: number;
+  requireLegs: boolean;
+  peakRiskAlerts: boolean;
+};
+
+type MarketAlert = {
+  id: string;
+  symbol: string;
+  kind: "FAST_SPIKE" | "BUILDING" | "SCALP_TEST" | "PEAK_RISK";
+  title: string;
+  detail: string;
+  tone: string;
+  score: number;
+};
+
 // ===== Phase 3 types =====
 type StructureLabel = "OK" | "WAIT" | "NO_EDGE";
 type StructureResult = {
@@ -334,6 +353,14 @@ function CoinPerformanceChart({ prices }: { prices: number[] }) {
       </div>
     </div>
   );
+}
+
+function recentPathPct(prices: number[], pointsBack: number) {
+  const clean = prices.filter((p) => typeof p === "number" && isFinite(p) && p > 0);
+  if (clean.length < 2) return 0;
+  const from = clean[Math.max(0, clean.length - 1 - pointsBack)];
+  const last = clean[clean.length - 1];
+  return from > 0 ? ((last - from) / from) * 100 : 0;
 }
 
 function useInterval(callback: () => void, delayMs: number | null) {
@@ -573,6 +600,7 @@ const LS_LEADS = "ob:leads";
 const LS_SIM = "ob:simulator";
 const LS_GOAL_PLAN = "ob:goal-plan";
 const LS_AI_SIGNALS = "ob:ai-signals";
+const LS_ALERT_SETTINGS = "ob:alert-settings";
 const CHECKOUT_URL =
   (import.meta.env.VITE_CHECKOUT_URL as string | undefined) ||
   "mailto:you@example.com?subject=Obsidian%20Pro%20access&body=I%20want%20Obsidian%20Crypto%20Trader%20Pro.";
@@ -584,6 +612,30 @@ const COMMIT_SESSION_OPTIONS: Array<[CommitSessionKey, string]> = [
   ["allowUS", "US"],
   ["allowOffPeak", "Off-peak"],
 ];
+
+function defaultAlertSettings(): AlertSettings {
+  return {
+    enabled: true,
+    minFastMovePct: 2.5,
+    minBuildMovePct: 5,
+    minBurstScore: 72,
+    requireLegs: true,
+    peakRiskAlerts: true,
+  };
+}
+
+function loadAlertSettings(): AlertSettings {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LS_ALERT_SETTINGS) || "null") as Partial<AlertSettings> | null;
+    return { ...defaultAlertSettings(), ...(parsed ?? {}) };
+  } catch {
+    return defaultAlertSettings();
+  }
+}
+
+function saveAlertSettings(settings: AlertSettings) {
+  localStorage.setItem(LS_ALERT_SETTINGS, JSON.stringify(settings));
+}
 
 function loadCommit(dayKey: string): CommitConfig | null {
   try {
@@ -1209,6 +1261,11 @@ export default function App() {
   const [aiAdvisorError, setAiAdvisorError] = useState<string | null>(null);
   const [aiSignals, setAiSignals] = useState<AiSignalRecord[]>(() => loadAiSignals());
   const [liveNewsMode, setLiveNewsMode] = useState(false);
+  const [alertSettings, setAlertSettings] = useState<AlertSettings>(() => loadAlertSettings());
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() =>
+    typeof Notification === "undefined" ? "unsupported" : Notification.permission
+  );
+  const alertNotifyRef = useRef<Record<string, number>>({});
 
   const [, setClockTick] = useState(0);
 
@@ -1272,6 +1329,7 @@ export default function App() {
   useEffect(() => saveSimState(simState), [simState]);
   useEffect(() => saveGoalPlan(goalPlan), [goalPlan]);
   useEffect(() => saveAiSignals(aiSignals), [aiSignals]);
+  useEffect(() => saveAlertSettings(alertSettings), [alertSettings]);
 
   useInterval(() => setClockTick((x) => x + 1), 1000);
 
@@ -1751,6 +1809,98 @@ export default function App() {
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
   const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
   const scalpSignalBySymbol = useMemo(() => new Map(scalpSignals.map((s) => [s.symbol, s])), [scalpSignals]);
+  const marketAlerts = useMemo<MarketAlert[]>(() => {
+    if (!alertSettings.enabled) return [];
+    const alerts: MarketAlert[] = [];
+    const seen = new Set<string>();
+
+    for (const signal of scalpSignals.slice(0, 12)) {
+      const history = priceHistoryMap[signal.symbol] ?? [];
+      const fastPct = recentPathPct(history, 6);
+      const buildPct = recentPathPct(history, 24);
+      const legsOk = !alertSettings.requireLegs || signal.legsLabel === "HAS LEGS" || signal.legsLabel === "MAYBE LEGS";
+
+      if (fastPct >= alertSettings.minFastMovePct && legsOk && signal.peakRiskScore < 58) {
+        const id = `${signal.symbol}:FAST_SPIKE`;
+        seen.add(id);
+        alerts.push({
+          id,
+          symbol: signal.symbol,
+          kind: "FAST_SPIKE",
+          title: `${signal.symbol} fast spike`,
+          detail: `${fastPct.toFixed(2)}% jump over recent chart ticks. Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}.`,
+          tone: "#047857",
+          score: Math.round(signal.burstScore + fastPct * 4),
+        });
+      }
+
+      if (buildPct >= alertSettings.minBuildMovePct && legsOk && signal.action !== "TOO_LATE") {
+        const id = `${signal.symbol}:BUILDING`;
+        if (!seen.has(id)) {
+          seen.add(id);
+          alerts.push({
+            id,
+            symbol: signal.symbol,
+            kind: "BUILDING",
+            title: `${signal.symbol} building move`,
+            detail: `${buildPct.toFixed(2)}% 24h path acceleration. Watch for pullback/reclaim rather than chasing the high.`,
+            tone: "#0f766e",
+            score: Math.round(signal.burstScore + buildPct * 2),
+          });
+        }
+      }
+
+      if (signal.action === "SCALP_TEST" && signal.burstScore >= alertSettings.minBurstScore && legsOk) {
+        const id = `${signal.symbol}:SCALP_TEST`;
+        if (!seen.has(id)) {
+          seen.add(id);
+          alerts.push({
+            id,
+            symbol: signal.symbol,
+            kind: "SCALP_TEST",
+            title: `${signal.symbol} scalp test`,
+            detail: `Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}. Hold window: ${signal.holdWindow}`,
+            tone: signal.tone,
+            score: signal.burstScore,
+          });
+        }
+      }
+
+      if (alertSettings.peakRiskAlerts && signal.peakRiskScore >= 70) {
+        const id = `${signal.symbol}:PEAK_RISK`;
+        if (!seen.has(id)) {
+          seen.add(id);
+          alerts.push({
+            id,
+            symbol: signal.symbol,
+            kind: "PEAK_RISK",
+            title: `${signal.symbol} peak risk`,
+            detail: `Peak risk ${signal.peakRiskScore}/100. This may already be late; wait for pullback/reclaim.`,
+            tone: "#b91c1c",
+            score: signal.peakRiskScore,
+          });
+        }
+      }
+    }
+
+    return alerts.sort((a, b) => b.score - a.score).slice(0, 12);
+  }, [alertSettings, priceHistoryMap, scalpSignals]);
+
+  useEffect(() => {
+    if (!alertSettings.enabled || notificationPermission !== "granted" || typeof Notification === "undefined") return;
+    const now = Date.now();
+    for (const alert of marketAlerts.slice(0, 3)) {
+      const lastSent = alertNotifyRef.current[alert.id] ?? 0;
+      if (now - lastSent < 10 * 60 * 1000) continue;
+      alertNotifyRef.current[alert.id] = now;
+      new Notification(alert.title, {
+        body: alert.detail,
+        tag: alert.id,
+        requireInteraction: alert.kind === "FAST_SPIKE" || alert.kind === "SCALP_TEST",
+      });
+    }
+  }, [alertSettings.enabled, marketAlerts, notificationPermission]);
+
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
     const base = setups.length ? setups : COINS.map((c) => ({
@@ -2679,6 +2829,15 @@ export default function App() {
 
   const openCheckout = () => {
     window.open(CHECKOUT_URL, "_blank", "noopener,noreferrer");
+  };
+
+  const requestAlertPermission = async () => {
+    if (typeof Notification === "undefined") {
+      setNotificationPermission("unsupported");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
   };
 
   const exportJournalCsv = () => {
@@ -5486,6 +5645,106 @@ export default function App() {
     </>
   );
 
+  const Alerts = () => (
+    <div style={{ ...panel, marginTop: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <div>
+          <div style={sectionTitle}>PHONE ALERTS / SCALP WATCH</div>
+          <div style={{ ...subtle, marginTop: 6 }}>
+            Watches the scalp scanner every {MARKET_REFRESH_LABEL}. Keep the site open on your phone, allow notifications, and it will shout when fast moves start.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ ...pill, color: alertSettings.enabled ? "#047857" : "#b91c1c" }}>
+            {alertSettings.enabled ? "ALERTS ON" : "ALERTS OFF"}
+          </span>
+          <span style={{ ...pill, color: notificationPermission === "granted" ? "#047857" : notificationPermission === "denied" ? "#b91c1c" : "#92400e" }}>
+            PHONE {notificationPermission.toUpperCase()}
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "0.8fr 1.2fr", gap: 14, marginTop: 14 }}>
+        <div style={proPanel}>
+          <div style={sectionTitle}>ALERT RULES</div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, fontWeight: 900, color: "#111827" }}>
+            <input type="checkbox" checked={alertSettings.enabled} onChange={(e) => setAlertSettings((s) => ({ ...s, enabled: e.target.checked }))} />
+            Enable scalp alerts
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontWeight: 900, color: "#111827" }}>
+            <input type="checkbox" checked={alertSettings.requireLegs} onChange={(e) => setAlertSettings((s) => ({ ...s, requireLegs: e.target.checked }))} />
+            Require legs before buy-style alerts
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontWeight: 900, color: "#111827" }}>
+            <input type="checkbox" checked={alertSettings.peakRiskAlerts} onChange={(e) => setAlertSettings((s) => ({ ...s, peakRiskAlerts: e.target.checked }))} />
+            Warn when a move is probably late
+          </label>
+
+          <div style={{ display: "grid", gap: 10, marginTop: 14 }}>
+            <label>
+              <div style={subtle}>Fast spike threshold (%)</div>
+              <input style={input} inputMode="decimal" value={String(alertSettings.minFastMovePct)} onChange={(e) => setAlertSettings((s) => ({ ...s, minFastMovePct: Number(e.target.value) || 0 }))} />
+            </label>
+            <label>
+              <div style={subtle}>Building move threshold (%)</div>
+              <input style={input} inputMode="decimal" value={String(alertSettings.minBuildMovePct)} onChange={(e) => setAlertSettings((s) => ({ ...s, minBuildMovePct: Number(e.target.value) || 0 }))} />
+            </label>
+            <label>
+              <div style={subtle}>Minimum burst score</div>
+              <input style={input} inputMode="numeric" value={String(alertSettings.minBurstScore)} onChange={(e) => setAlertSettings((s) => ({ ...s, minBurstScore: Number(e.target.value) || 0 }))} />
+            </label>
+          </div>
+
+          <button style={notificationPermission === "granted" ? btnDisabled : btnDanger} disabled={notificationPermission === "granted"} onClick={requestAlertPermission}>
+            {notificationPermission === "granted" ? "Phone Notifications Enabled" : "Enable Phone Notifications"}
+          </button>
+          <div style={{ ...subtle, marginTop: 10 }}>
+            For proper phone alerts, open the live site on your phone and allow notifications there. If the browser blocks background notifications, the next upgrade is Telegram/Pushover server push.
+          </div>
+        </div>
+
+        <div style={proPanel}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <div style={sectionTitle}>LIVE ALERT FEED</div>
+              <div style={{ ...subtle, marginTop: 6 }}>What the app would notify you about right now.</div>
+            </div>
+            <button style={btn} onClick={refresh} disabled={isLoading}>
+              {isLoading ? "Refreshing..." : "Refresh Market"}
+            </button>
+          </div>
+
+          <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+            {marketAlerts.length ? (
+              marketAlerts.map((alert) => (
+                <div key={alert.id} style={{ ...statCard, background: "#ffffff", borderColor: alert.tone }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                    <div>
+                      <div style={{ fontWeight: 950, color: alert.tone }}>{alert.title}</div>
+                      <div style={{ ...subtle, marginTop: 5 }}>{alert.detail}</div>
+                    </div>
+                    <button
+                      style={btn}
+                      onClick={() => {
+                        setSimSymbol(alert.symbol);
+                        setFocusSymbol(alert.symbol);
+                        setTab("simulator");
+                      }}
+                    >
+                      Inspect
+                    </button>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div style={emptyState}>No alert-grade moves right now. Leave auto-refresh on and this feed will light up when something starts moving.</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   const Pro = () => (
     <>
       <div style={{ ...panel, marginTop: 14 }}>
@@ -5637,6 +5896,9 @@ export default function App() {
             <div style={tabBtn(tab === "simulator")} onClick={() => setTab("simulator")}>
               Simulator
             </div>
+            <div style={tabBtn(tab === "alerts")} onClick={() => setTab("alerts")}>
+              Alerts
+            </div>
             <div style={tabBtn(tab === "accuracy")} onClick={() => setTab("accuracy")}>
               Accuracy
             </div>
@@ -5710,7 +5972,7 @@ export default function App() {
       </div>
 
       <div style={shell}>
-        {commitRequired && tab !== "simulator" && tab !== "plan" && tab !== "accuracy" && tab !== "pro" ? (
+        {commitRequired && tab !== "simulator" && tab !== "alerts" && tab !== "plan" && tab !== "accuracy" && tab !== "pro" ? (
           <>
             {commitmentPanel}
             <div style={{ marginTop: 14, ...panel }}>
@@ -5729,6 +5991,7 @@ export default function App() {
             {tab === "history" && History()}
             {tab === "plan" && Plan()}
             {tab === "simulator" && Simulator()}
+            {tab === "alerts" && Alerts()}
             {tab === "accuracy" && Accuracy()}
             {tab === "pro" && Pro()}
           </>
