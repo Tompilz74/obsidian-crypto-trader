@@ -114,6 +114,8 @@ type SimPosition = {
   side: TradeSide;
   mode?: SimTradeMode;
   platform?: "REVOLUT_X" | "GENERIC";
+  marketEntry?: number;
+  entrySlippagePct?: number;
   entry: number;
   qty: number;
   notionalUsd: number;
@@ -678,6 +680,7 @@ const LS_PRO_PASS = "ob:pro-pass";
 const LS_LEADS = "ob:leads";
 const LS_SIM = "ob:simulator";
 const LS_SIM_REVOLUT_X_MODE = "ob:sim-revolut-x-mode";
+const LS_SIM_ENTRY_SLIPPAGE_PCT = "ob:sim-entry-slippage-pct";
 const LS_CUSTOM_REVOLUT_COINS = "ob:custom-revolut-coins";
 const LS_HIDE_FLAT_COINS = "ob:hide-flat-coins";
 const LS_GOAL_PLAN = "ob:goal-plan";
@@ -685,6 +688,7 @@ const LS_AI_SIGNALS = "ob:ai-signals";
 const LS_ALERT_SETTINGS = "ob:alert-settings";
 const REVOLUT_X_TAKER_FEE_PCT = 0.09;
 const REVOLUT_X_ROUND_TRIP_FEE_PCT = REVOLUT_X_TAKER_FEE_PCT * 2;
+const DEFAULT_REVOLUT_X_ENTRY_SLIPPAGE_PCT = 0.3;
 const CHECKOUT_URL =
   (import.meta.env.VITE_CHECKOUT_URL as string | undefined) ||
   "mailto:you@example.com?subject=Obsidian%20Pro%20access&body=I%20want%20Obsidian%20Crypto%20Trader%20Pro.";
@@ -800,6 +804,19 @@ function loadSimRevolutXMode() {
 
 function saveSimRevolutXMode(enabled: boolean) {
   localStorage.setItem(LS_SIM_REVOLUT_X_MODE, String(enabled));
+}
+
+function loadSimEntrySlippagePct() {
+  try {
+    const parsed = Number(localStorage.getItem(LS_SIM_ENTRY_SLIPPAGE_PCT));
+    return Number.isFinite(parsed) ? clamp(parsed, 0, 3) : DEFAULT_REVOLUT_X_ENTRY_SLIPPAGE_PCT;
+  } catch {
+    return DEFAULT_REVOLUT_X_ENTRY_SLIPPAGE_PCT;
+  }
+}
+
+function saveSimEntrySlippagePct(value: number) {
+  localStorage.setItem(LS_SIM_ENTRY_SLIPPAGE_PCT, String(clamp(value, 0, 3)));
 }
 
 function normalizeCoinDef(coin: Partial<CoinDef>): CoinDef | null {
@@ -1442,6 +1459,7 @@ export default function App() {
   const [simTradeMode, setSimTradeMode] = useState<SimTradeMode>("SCALP");
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simRevolutXMode, setSimRevolutXMode] = useState(() => loadSimRevolutXMode());
+  const [simEntrySlippagePctText, setSimEntrySlippagePctText] = useState(() => String(loadSimEntrySlippagePct()));
   const [customRevolutCoins, setCustomRevolutCoins] = useState<CoinDef[]>(() => loadCustomRevolutCoins());
   const [hideFlatCoins, setHideFlatCoins] = useState(() => loadHideFlatCoins());
   const [customCoinSymbol, setCustomCoinSymbol] = useState("");
@@ -1479,6 +1497,10 @@ export default function App() {
   useEffect(() => saveDayState(dayState), [dayState]);
   useEffect(() => saveSimState(simState), [simState]);
   useEffect(() => saveSimRevolutXMode(simRevolutXMode), [simRevolutXMode]);
+  useEffect(() => {
+    const parsed = Number(simEntrySlippagePctText);
+    if (Number.isFinite(parsed)) saveSimEntrySlippagePct(parsed);
+  }, [simEntrySlippagePctText]);
   useEffect(() => saveCustomRevolutCoins(customRevolutCoins), [customRevolutCoins]);
   useEffect(() => saveHideFlatCoins(hideFlatCoins), [hideFlatCoins]);
   useEffect(() => saveGoalPlan(goalPlan), [goalPlan]);
@@ -1903,18 +1925,40 @@ export default function App() {
   const simStopLoss = Number(simStopLossInput);
   const simTakeProfit = Number(simTakeProfitInput);
   const simStopLossValid = simCanBuySelected && Number.isFinite(simStopLoss) && simStopLoss > 0 && simStopLoss < simulatorPrice;
-  const simTakeProfitValid = simCanBuySelected && Number.isFinite(simTakeProfit) && simTakeProfit > simulatorPrice;
+  const simEntrySlippagePct = simRevolutXMode ? clamp(Number(simEntrySlippagePctText) || 0, 0, 3) : 0;
+  const simExecutionEntryPrice = simulatorPrice ? simulatorPrice * (1 + simEntrySlippagePct / 100) : 0;
+  const simEntryFeePct = simRevolutXMode ? REVOLUT_X_TAKER_FEE_PCT : 0;
+  const simExitFeePct = simRevolutXMode ? REVOLUT_X_TAKER_FEE_PCT : 0;
+  const requiredGrossMoveForNet = useCallback(
+    (netPct: number) => {
+      const exitMultipleNeeded = (1 + simEntrySlippagePct / 100) * (1 + simEntryFeePct / 100 + netPct / 100) / (1 - simExitFeePct / 100);
+      return (exitMultipleNeeded - 1) * 100;
+    },
+    [simEntryFeePct, simEntrySlippagePct, simExitFeePct]
+  );
+  const simBreakEvenMovePct = requiredGrossMoveForNet(0);
+  const simRequiredGrossForOneNetPct = requiredGrossMoveForNet(1);
+  const simTakeProfitValid = simCanBuySelected && Number.isFinite(simTakeProfit) && simTakeProfit > Math.max(simulatorPrice, simExecutionEntryPrice);
   const simTicketUsd = Number(simBuyUsd);
   const simTicketNotional = Number.isFinite(simTicketUsd) && simTicketUsd > 0 ? simTicketUsd : 0;
-  const simEntryFeeUsd = simRevolutXMode ? simTicketNotional * (REVOLUT_X_TAKER_FEE_PCT / 100) : 0;
-  const simEstimatedExitFeeUsd = simRevolutXMode ? simTicketNotional * (REVOLUT_X_TAKER_FEE_PCT / 100) : 0;
+  const simEntryFeeUsd = simTicketNotional * (simEntryFeePct / 100);
+  const simEstimatedExitFeeUsd = simTicketNotional * (simExitFeePct / 100);
   const simEstimatedRoundTripFeeUsd = simEntryFeeUsd + simEstimatedExitFeeUsd;
   const simCashRequired = simTicketNotional + simEntryFeeUsd;
-  const simBreakEvenMovePct = simTicketNotional > 0 ? (simEstimatedRoundTripFeeUsd / simTicketNotional) * 100 : 0;
-  const simPlannedLossPct = simStopLossValid ? ((simulatorPrice - simStopLoss) / simulatorPrice) * 100 : 0;
-  const simPlannedGainPct = simTakeProfitValid ? ((simTakeProfit - simulatorPrice) / simulatorPrice) * 100 : 0;
-  const simPlannedNetLossPct = simPlannedLossPct ? simPlannedLossPct + simBreakEvenMovePct : 0;
-  const simPlannedNetGainPct = simPlannedGainPct ? simPlannedGainPct - simBreakEvenMovePct : 0;
+  const simPlannedLossPct = simStopLossValid && simExecutionEntryPrice ? ((simExecutionEntryPrice - simStopLoss) / simExecutionEntryPrice) * 100 : 0;
+  const simPlannedGainPct = simTakeProfitValid && simExecutionEntryPrice ? ((simTakeProfit - simExecutionEntryPrice) / simExecutionEntryPrice) * 100 : 0;
+  const estimatedNetPctAtExit = useCallback(
+    (exitPrice: number) => {
+      if (!simTicketNotional || !simExecutionEntryPrice || !exitPrice) return 0;
+      const qty = simTicketNotional / simExecutionEntryPrice;
+      const grossValue = exitPrice * qty;
+      const exitFeeUsd = grossValue * (simExitFeePct / 100);
+      return ((grossValue - exitFeeUsd - simTicketNotional - simEntryFeeUsd) / simTicketNotional) * 100;
+    },
+    [simEntryFeeUsd, simExecutionEntryPrice, simExitFeePct, simTicketNotional]
+  );
+  const simPlannedNetLossPct = simStopLossValid ? Math.abs(Math.min(0, estimatedNetPctAtExit(simStopLoss))) : 0;
+  const simPlannedNetGainPct = simTakeProfitValid ? estimatedNetPctAtExit(simTakeProfit) : 0;
   const simRewardRisk = simPlannedLossPct > 0 && simPlannedGainPct > 0 ? simPlannedGainPct / simPlannedLossPct : 0;
   const scalpSignals = useMemo<ScalpSignal[]>(() => {
     return setups
@@ -1985,7 +2029,9 @@ export default function App() {
         const pathBonus = pathAware ? (path.label === "LIFTING" ? 16 : path.label === "BUILDING" ? 9 : path.label === "VERTICAL" ? -10 : 0) : 0;
         const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + pathBonus + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
-        const targetPct = clamp(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), 0.85, 3.4);
+        const rawTargetPct = stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65);
+        const minNetTargetPct = simRevolutXMode ? Math.max(0.95, simRequiredGrossForOneNetPct) : 0.85;
+        const targetPct = clamp(Math.max(rawTargetPct, minNetTargetPct), minNetTargetPct, 4.8);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
         const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 55 && continuationOk && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
@@ -2011,6 +2057,7 @@ export default function App() {
         if (peakRisk) warnings.push(`Peak risk: +${spike6h.toFixed(2)}% from 6h low with limited fresh acceleration.`);
         if (tooLate && !peakRisk) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
         if (dumpRisk) warnings.push("Recent pullback/dump risk or fast 1h weakness is active.");
+        if (simRevolutXMode) warnings.push(`Needs about +${simRequiredGrossForOneNetPct.toFixed(2)}% gross from market to net +1% after execution drag.`);
         if (!activeEnough) warnings.push("No useful movement right now; hidden from active scalp mode unless searched.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
@@ -2020,7 +2067,7 @@ export default function App() {
       .filter((s) => !hideFlatCoins || s.action !== "NO_LIQUIDITY")
       .sort((a, b) => b.burstScore - a.burstScore)
       .slice(0, 20);
-  }, [getSimPrice, hideFlatCoins, priceHistoryMap, setups, simState.cashUsd]);
+  }, [getSimPrice, hideFlatCoins, priceHistoryMap, setups, simRequiredGrossForOneNetPct, simRevolutXMode, simState.cashUsd]);
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
   const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
   const scalpSignalBySymbol = useMemo(() => new Map(scalpSignals.map((s) => [s.symbol, s])), [scalpSignals]);
@@ -2308,7 +2355,7 @@ export default function App() {
         const micro = microMap[s.symbol];
         const strict = s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70;
         const proxyReturnPct = micro?.ret4h ?? (s.change24h ?? 0) * 0.18;
-        const afterCostsPct = proxyReturnPct - 0.28;
+        const afterCostsPct = proxyReturnPct - (simRevolutXMode ? simBreakEvenMovePct : REVOLUT_X_ROUND_TRIP_FEE_PCT);
         const result = strict ? afterCostsPct : 0;
         return { symbol: s.symbol, strict, score: s.combinedScore, proxyReturnPct, afterCostsPct, result };
       });
@@ -2319,7 +2366,7 @@ export default function App() {
     const best = [...trades].sort((a, b) => b.result - a.result)[0];
     const worst = [...trades].sort((a, b) => a.result - b.result)[0];
     return { rows, trades, wins, winRate, expectancyPct, best, worst };
-  }, [microMap, setups]);
+  }, [microMap, setups, simBreakEvenMovePct, simRevolutXMode]);
 
   const todaySimProgress = useMemo(() => {
     const realizedToday = simState.history
@@ -2380,13 +2427,13 @@ export default function App() {
         : watchlistHealth.tradable >= 1
           ? "SELECTIVE"
           : "DEFENSIVE";
-    const feeDragPct = 0.28;
+    const feeDragPct = simRevolutXMode ? simBreakEvenMovePct : REVOLUT_X_ROUND_TRIP_FEE_PCT;
     const structureBonus = structureOk ? 0.45 : -0.75;
     const entryBonus = entryOk ? 0.35 : -0.65;
     const scannerEdgePct = clamp((score - 62) * 0.055 + structureBonus + entryBonus - feeDragPct, -2.5, 4.5);
     const estimatedMovePct = clamp(Math.max(0.35, Math.abs(simSelectedSetup?.change24h ?? 0) * 0.18), 0.35, 3.6);
     const stopPct = clamp(estimatedMovePct * 0.55, 0.55, 2.4);
-    const targetPct = clamp(stopPct * 2.05, 1.15, 5.5);
+    const targetPct = clamp(Math.max(stopPct * 2.05, simRevolutXMode ? simRequiredGrossForOneNetPct : 1.15), 1.15, 5.5);
     const requiredWinRate = clamp((stopPct + feeDragPct) / (targetPct + stopPct) * 100, 18, 68);
     const drawdownPct = ((simEquity - simState.startingCashUsd) / simState.startingCashUsd) * 100;
     const riskState =
@@ -2444,10 +2491,13 @@ export default function App() {
     simSelectedHolding,
     simSelectedHoldingPnl,
     simSelectedSetup,
+    simBreakEvenMovePct,
     simState.cashUsd,
     simState.positions.length,
     simState.startingCashUsd,
     simSymbol,
+    simRequiredGrossForOneNetPct,
+    simRevolutXMode,
     signalCalibration.adjustment,
     watchlistHealth.avgScore,
     watchlistHealth.scanned,
@@ -2896,6 +2946,8 @@ export default function App() {
       alert("Set a stop loss below the current price and a take profit above the current price before buying.");
       return;
     }
+    const entrySlippagePct = simRevolutXMode ? simEntrySlippagePct : 0;
+    const executionEntry = price * (1 + entrySlippagePct / 100);
     const setup = setups.find((s) => s.symbol === symbol);
     const position: SimPosition = {
       id: uuid(),
@@ -2904,8 +2956,10 @@ export default function App() {
       side: "LONG",
       mode: simTradeMode,
       platform: simRevolutXMode ? "REVOLUT_X" : "GENERIC",
-      entry: price,
-      qty: notional / price,
+      marketEntry: price,
+      entrySlippagePct,
+      entry: executionEntry,
+      qty: notional / executionEntry,
       notionalUsd: notional,
       entryFeeUsd,
       stop: simStopLossValid ? simStopLoss : undefined,
@@ -2924,10 +2978,10 @@ export default function App() {
     setSimSymbol(symbol);
     setFocusSymbol(symbol);
     if (price) {
-      setEntryPrice(price);
-      setStopPrice(price * 0.985);
-      setSimStopLossInput((price * 0.985).toPrecision(8));
-      setSimTakeProfitInput((price * 1.03).toPrecision(8));
+      setEntryPrice(executionEntry);
+      setStopPrice(executionEntry * 0.985);
+      setSimStopLossInput((executionEntry * 0.985).toPrecision(8));
+      setSimTakeProfitInput((executionEntry * 1.03).toPrecision(8));
     }
     setSimThesis("");
   };
@@ -4696,11 +4750,53 @@ export default function App() {
                   ? `Uses the Revolut coin universe and estimates taker costs: ${REVOLUT_X_TAKER_FEE_PCT.toFixed(2)}% entry + ${REVOLUT_X_TAKER_FEE_PCT.toFixed(2)}% exit = ${REVOLUT_X_ROUND_TRIP_FEE_PCT.toFixed(2)}% round trip.`
                   : "Uses generic simulator conditions without platform-specific fee drag."}
               </div>
+              {simRevolutXMode && (
+                <div style={{ ...subtle, marginTop: 5 }}>
+                  Execution spread/slippage is also applied to entries. Current setting: {simEntrySlippagePct.toFixed(2)}% worse than market.
+                </div>
+              )}
             </div>
             <button style={simRevolutXMode ? btnDanger : btn} onClick={() => setSimRevolutXMode((v) => !v)}>
               {simRevolutXMode ? "Turn Off Revolut X Mode" : "Turn On Revolut X Mode"}
             </button>
           </div>
+          {simRevolutXMode && (
+            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 2fr", gap: 10, marginTop: 12, alignItems: "end" }}>
+              <div>
+                <div style={subtle}>Entry spread/slippage %</div>
+                <input
+                  style={input}
+                  inputMode="decimal"
+                  value={simEntrySlippagePctText}
+                  onChange={(e) => setSimEntrySlippagePctText(e.target.value)}
+                  placeholder="0.30"
+                />
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                {["0.27", "0.30", "0.50", "0.90"].map((pct) => (
+                  <button key={pct} style={btn} onClick={() => setSimEntrySlippagePctText(pct)}>
+                    {pct}%
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {simRevolutXMode && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10, marginTop: 10 }}>
+              <div style={statCard}>
+                <div style={subtle}>Break-even move</div>
+                <div style={{ fontWeight: 950 }}>{simBreakEvenMovePct.toFixed(2)}%</div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Gross for +1% net</div>
+                <div style={{ fontWeight: 950, color: "#047857" }}>{simRequiredGrossForOneNetPct.toFixed(2)}%</div>
+              </div>
+              <div style={statCard}>
+                <div style={subtle}>Total drag model</div>
+                <div style={{ fontWeight: 950 }}>{(simEntrySlippagePct + REVOLUT_X_ROUND_TRIP_FEE_PCT).toFixed(2)}%</div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div style={{ marginTop: 12, height: 8, borderRadius: 999, background: "#e2e8f0", overflow: "hidden" }}>
@@ -5292,6 +5388,24 @@ export default function App() {
               </button>
             </div>
             <div style={{ ...subtle, marginTop: 8 }}>Use the scrollable coin list on the right to choose what to buy.</div>
+            {simRevolutXMode && simulatorPrice > 0 && (
+              <div style={{ ...statCard, marginTop: 10, background: "#f8fafc" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                  <div>
+                    <div style={subtle}>Market</div>
+                    <div style={{ fontWeight: 950 }}>{fmtUsd(simulatorPrice)}</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Sim fill</div>
+                    <div style={{ fontWeight: 950, color: "#b91c1c" }}>{fmtUsd(simExecutionEntryPrice)}</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Entry drag</div>
+                    <div style={{ fontWeight: 950 }}>{simEntrySlippagePct.toFixed(2)}%</div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           <div style={{ marginTop: 10 }}>
@@ -5378,13 +5492,18 @@ export default function App() {
                 {simRevolutXMode ? "Revolut X net check" : "Fee model off"}
               </div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                Est. fees {fmtUsd(simEstimatedRoundTripFeeUsd)} ({simBreakEvenMovePct.toFixed(2)}%). Net target{" "}
+                Est. fees {fmtUsd(simEstimatedRoundTripFeeUsd)}. Break-even needs +{simBreakEvenMovePct.toFixed(2)}% from market. Net target{" "}
                 <b style={{ color: simPlannedNetGainPct > 0 ? "#047857" : "#b91c1c" }}>
                   {simPlannedNetGainPct >= 0 ? "+" : ""}
                   {simPlannedNetGainPct.toFixed(2)}%
                 </b>{" "}
                 · net stop -{simPlannedNetLossPct.toFixed(2)}%.
               </div>
+              {simRevolutXMode && (
+                <div style={{ ...subtle, marginTop: 6 }}>
+                  To actually net +1.00%, this coin needs about +{simRequiredGrossForOneNetPct.toFixed(2)}% from the displayed market price.
+                </div>
+              )}
             </div>
           </div>
 
