@@ -679,6 +679,7 @@ const LS_LEADS = "ob:leads";
 const LS_SIM = "ob:simulator";
 const LS_SIM_REVOLUT_X_MODE = "ob:sim-revolut-x-mode";
 const LS_CUSTOM_REVOLUT_COINS = "ob:custom-revolut-coins";
+const LS_HIDE_FLAT_COINS = "ob:hide-flat-coins";
 const LS_GOAL_PLAN = "ob:goal-plan";
 const LS_AI_SIGNALS = "ob:ai-signals";
 const LS_ALERT_SETTINGS = "ob:alert-settings";
@@ -829,6 +830,19 @@ function loadCustomRevolutCoins(): CoinDef[] {
 
 function saveCustomRevolutCoins(coins: CoinDef[]) {
   localStorage.setItem(LS_CUSTOM_REVOLUT_COINS, JSON.stringify(coins.map(normalizeCoinDef).filter(Boolean)));
+}
+
+function loadHideFlatCoins() {
+  try {
+    const stored = localStorage.getItem(LS_HIDE_FLAT_COINS);
+    return stored === null ? true : stored === "true";
+  } catch {
+    return true;
+  }
+}
+
+function saveHideFlatCoins(enabled: boolean) {
+  localStorage.setItem(LS_HIDE_FLAT_COINS, String(enabled));
 }
 
 function goalPeriodDays(period: GoalPeriod) {
@@ -1429,6 +1443,7 @@ export default function App() {
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simRevolutXMode, setSimRevolutXMode] = useState(() => loadSimRevolutXMode());
   const [customRevolutCoins, setCustomRevolutCoins] = useState<CoinDef[]>(() => loadCustomRevolutCoins());
+  const [hideFlatCoins, setHideFlatCoins] = useState(() => loadHideFlatCoins());
   const [customCoinSymbol, setCustomCoinSymbol] = useState("");
   const [customCoinCgId, setCustomCoinCgId] = useState("");
   const [customCoinName, setCustomCoinName] = useState("");
@@ -1465,6 +1480,7 @@ export default function App() {
   useEffect(() => saveSimState(simState), [simState]);
   useEffect(() => saveSimRevolutXMode(simRevolutXMode), [simRevolutXMode]);
   useEffect(() => saveCustomRevolutCoins(customRevolutCoins), [customRevolutCoins]);
+  useEffect(() => saveHideFlatCoins(hideFlatCoins), [hideFlatCoins]);
   useEffect(() => saveGoalPlan(goalPlan), [goalPlan]);
   useEffect(() => saveAiSignals(aiSignals), [aiSignals]);
   useEffect(() => saveAlertSettings(alertSettings), [alertSettings]);
@@ -1754,16 +1770,32 @@ export default function App() {
   const universeStats = useMemo(() => {
     const live = marketUniverse.filter((m) => typeof m.priceUsd === "number" && isFinite(m.priceUsd)).length;
     const missing = Math.max(0, allCoins.length - live);
-    return { total: allCoins.length, live, missing, custom: customRevolutCoins.length };
-  }, [allCoins.length, customRevolutCoins.length, marketUniverse]);
+    const active = hideFlatCoins
+      ? marketUniverse.filter((m) => {
+          const change = Math.abs(m.change24h ?? 0);
+          const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
+          const hasVolume = (m.volume24hUsd ?? 0) > 0;
+          return hasLivePrice && hasVolume && change >= 0.8;
+        }).length
+      : marketUniverse.length;
+    return { total: allCoins.length, active, live, missing, custom: customRevolutCoins.length };
+  }, [allCoins.length, customRevolutCoins.length, hideFlatCoins, marketUniverse]);
 
   const filteredMarket = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return marketUniverse;
-    return marketUniverse.filter(
-      (m) => (m.symbol ?? "").toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)
-    );
-  }, [marketUniverse, query]);
+    const searched = q
+      ? marketUniverse.filter(
+          (m) => (m.symbol ?? "").toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)
+        )
+      : marketUniverse;
+    if (q || !hideFlatCoins) return searched;
+    return searched.filter((m) => {
+      const change = Math.abs(m.change24h ?? 0);
+      const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
+      const hasVolume = (m.volume24hUsd ?? 0) > 0;
+      return hasLivePrice && hasVolume && change >= 0.8;
+    });
+  }, [hideFlatCoins, marketUniverse, query]);
 
   const baselineVol = useMemo(() => {
     const vols = filteredMarket
@@ -1894,6 +1926,7 @@ export default function App() {
         const move4h = typeof s.ret4h === "number" ? s.ret4h : ch24 * 0.38;
         const path = computePathMomentum(priceHistoryMap[s.symbol] ?? []);
         const pathAware = path.stairScore > 0;
+        const activeEnough = Math.abs(ch24) >= 0.8 || path.stairScore >= 55 || Math.abs(fastMove) >= 0.12 || Math.abs(move4h) >= 0.8;
         const stairLaunch = path.stairScore >= 70 && path.slopeLift > 0.08 && path.path4h >= 1.4 && path.pullbackPct > -2.4;
         const pathBreakout = path.path1h >= 1.25 && path.path4h >= 2.2 && path.slopeLift > 0.18 && path.verticalRisk < 72;
         const pathStillHasLegs = stairLaunch && path.verticalRisk < 62 && path.greenRatio >= 0.52;
@@ -1909,7 +1942,7 @@ export default function App() {
           0,
           100
         );
-        const liquidityOk = s.volFactor >= 1.15 && price > 0;
+        const liquidityOk = s.volFactor >= 1.15 && price > 0 && (!hideFlatCoins || activeEnough);
         const spike6h = s.spikeFromLow6h ?? Math.max(0, move4h);
         const dropFromHigh = s.dropFromHigh6h ?? 0;
         const latestWeak = hasMicro && fastMove <= 0;
@@ -1978,14 +2011,16 @@ export default function App() {
         if (peakRisk) warnings.push(`Peak risk: +${spike6h.toFixed(2)}% from 6h low with limited fresh acceleration.`);
         if (tooLate && !peakRisk) warnings.push("Move looks extended or momentum is fading; likely late chase risk.");
         if (dumpRisk) warnings.push("Recent pullback/dump risk or fast 1h weakness is active.");
+        if (!activeEnough) warnings.push("No useful movement right now; hidden from active scalp mode unless searched.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
         return { symbol: s.symbol, price, burstScore, legsScore, peakRiskScore, action, tone, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
       })
       .filter((s) => s.price > 0)
+      .filter((s) => !hideFlatCoins || s.action !== "NO_LIQUIDITY")
       .sort((a, b) => b.burstScore - a.burstScore)
       .slice(0, 20);
-  }, [getSimPrice, priceHistoryMap, setups, simState.cashUsd]);
+  }, [getSimPrice, hideFlatCoins, priceHistoryMap, setups, simState.cashUsd]);
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
   const scalpModeCanBuy = simTradeMode === "SCALP" && selectedScalpSignal?.action === "SCALP_TEST";
   const scalpSignalBySymbol = useMemo(() => new Map(scalpSignals.map((s) => [s.symbol, s])), [scalpSignals]);
@@ -3106,6 +3141,14 @@ export default function App() {
     setCustomRevolutCoins((coins) => coins.filter((coin) => coin.symbol.toUpperCase() !== symbol.toUpperCase()));
   };
 
+  const resetCoinUniverse = () => {
+    setCustomRevolutCoins([]);
+    setHideFlatCoins(true);
+    setQuery("");
+    setSimCoinSearch("");
+    setSimRevolutXMode(true);
+  };
+
   const exportJournalCsv = () => {
     const header = "time,symbol,side,entry,stop,exit,r,rules_followed,note";
     const lines = dayState.trades.map((t) =>
@@ -3911,7 +3954,7 @@ export default function App() {
             <div>
               <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
               <div style={{ ...subtle, marginTop: 4 }}>
-                Revolut X working universe: {universeStats.total} coins · custom {universeStats.custom} · live data {universeStats.live} · missing {universeStats.missing}
+                Revolut X active universe: {universeStats.active} shown · {universeStats.total} tracked · custom {universeStats.custom} · live {universeStats.live}
               </div>
             </div>
             <span style={pill}>Working universe</span>
@@ -3923,6 +3966,13 @@ export default function App() {
               <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
               Auto ({MARKET_REFRESH_LABEL})
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#64748b", fontWeight: 800 }}>
+              <input type="checkbox" checked={hideFlatCoins} onChange={(e) => setHideFlatCoins(e.target.checked)} />
+              Hide flat/no-data coins
+            </label>
+            <button style={btn} onClick={resetCoinUniverse}>
+              Reset Coin Universe
+            </button>
           </div>
 
           <div style={{ marginTop: 10, overflow: "auto", maxHeight: 420 }}>
@@ -5383,7 +5433,7 @@ export default function App() {
             <div>
               <div style={sectionTitle}>SCANNER UNIVERSE</div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                Revolut X working universe: {universeStats.total} coins including {universeStats.custom} custom additions. Live data loaded for {universeStats.live}; missing entries stay visible for cleanup.
+                Revolut X active universe: {simCoinChoices.length} shown from {universeStats.total} tracked coins. Flat/no-data coins are hidden unless you search.
               </div>
             </div>
             <input
@@ -5392,6 +5442,16 @@ export default function App() {
               value={simCoinSearch}
               onChange={(e) => setSimCoinSearch(e.target.value)}
             />
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#64748b", fontWeight: 800 }}>
+              <input type="checkbox" checked={hideFlatCoins} onChange={(e) => setHideFlatCoins(e.target.checked)} />
+              Hide flat/no-data coins
+            </label>
+            <button style={btn} onClick={resetCoinUniverse}>
+              Reset to Revolut X Active List
+            </button>
           </div>
 
           <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
