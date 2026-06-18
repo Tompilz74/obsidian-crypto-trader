@@ -1261,6 +1261,7 @@ const REVOLUT_UK_CANDIDATES: CoinDef[] = [
   { symbol: "SNT", cgId: "status", name: "Status" },
   { symbol: "POWR", cgId: "power-ledger", name: "Powerledger" },
   { symbol: "SYN", cgId: "synapse-2", name: "Synapse" },
+  { symbol: "SYND", cgId: "syndicate", name: "Syndicate" },
   { symbol: "BAL", cgId: "balancer", name: "Balancer" },
   { symbol: "TIA", cgId: "celestia", name: "Celestia" },
   { symbol: "MANTA", cgId: "manta-network", name: "Manta Network" },
@@ -3051,7 +3052,7 @@ export default function App() {
   const addCustomRevolutCoin = () => {
     const coin = normalizeCoinDef({ symbol: customCoinSymbol, cgId: customCoinCgId, name: customCoinName || customCoinSymbol });
     if (!coin) {
-      alert("Enter at least a symbol and CoinGecko ID, e.g. SYN / synapse-2.");
+      alert("Enter at least a symbol and CoinGecko ID, e.g. SYND / syndicate.");
       return;
     }
     const exists = allCoins.some((c) => c.symbol.toUpperCase() === coin.symbol);
@@ -5361,7 +5362,7 @@ export default function App() {
           <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
             <div style={{ fontWeight: 950, color: "#111827" }}>Add missing Revolut X coin</div>
             <div style={{ ...subtle, marginTop: 5 }}>
-              Add the symbol and CoinGecko ID from the coin page URL. Example: SYN uses <b>synapse-2</b>.
+              Add the symbol and CoinGecko ID from the coin page URL. Example: SYND uses <b>syndicate</b>; SYN uses <b>synapse-2</b>.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "0.6fr 1fr 1fr auto", gap: 8, marginTop: 10 }}>
               <input
