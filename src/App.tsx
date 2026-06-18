@@ -281,6 +281,7 @@ type PathMomentum = {
 
 type AlertSettings = {
   enabled: boolean;
+  telegramEnabled: boolean;
   minFastMovePct: number;
   minBuildMovePct: number;
   minBurstScore: number;
@@ -698,6 +699,7 @@ const COMMIT_SESSION_OPTIONS: Array<[CommitSessionKey, string]> = [
 function defaultAlertSettings(): AlertSettings {
   return {
     enabled: true,
+    telegramEnabled: true,
     minFastMovePct: 2.5,
     minBuildMovePct: 5,
     minBurstScore: 72,
@@ -1391,7 +1393,10 @@ export default function App() {
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() =>
     typeof Notification === "undefined" ? "unsupported" : Notification.permission
   );
+  const [telegramStatus, setTelegramStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  const [telegramError, setTelegramError] = useState<string | null>(null);
   const alertNotifyRef = useRef<Record<string, number>>({});
+  const telegramNotifyRef = useRef<Record<string, number>>({});
 
   const [, setClockTick] = useState(0);
 
@@ -2061,6 +2066,24 @@ export default function App() {
     return alerts.sort((a, b) => b.score - a.score).slice(0, 12);
   }, [alertSettings, priceHistoryMap, scalpSignals]);
 
+  const sendTelegramAlert = useCallback(async (alert: Pick<MarketAlert, "title" | "detail" | "symbol" | "kind">) => {
+    setTelegramStatus("sending");
+    setTelegramError(null);
+    try {
+      const res = await fetch("/.netlify/functions/telegramAlert", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(alert),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.ok === false) throw new Error(data?.setup || data?.error || "Telegram alert failed.");
+      setTelegramStatus("sent");
+    } catch (e: unknown) {
+      setTelegramStatus("error");
+      setTelegramError(getErrorMessage(e, "Telegram alert failed."));
+    }
+  }, []);
+
   useEffect(() => {
     if (!alertSettings.enabled || notificationPermission !== "granted" || typeof Notification === "undefined") return;
     const now = Date.now();
@@ -2075,6 +2098,18 @@ export default function App() {
       });
     }
   }, [alertSettings.enabled, marketAlerts, notificationPermission]);
+
+  useEffect(() => {
+    if (!alertSettings.enabled || !alertSettings.telegramEnabled) return;
+    const now = Date.now();
+    for (const alert of marketAlerts.slice(0, 3)) {
+      if (alert.kind === "PEAK_RISK") continue;
+      const lastSent = telegramNotifyRef.current[alert.id] ?? 0;
+      if (now - lastSent < 15 * 60 * 1000) continue;
+      telegramNotifyRef.current[alert.id] = now;
+      void sendTelegramAlert(alert);
+    }
+  }, [alertSettings.enabled, alertSettings.telegramEnabled, marketAlerts, sendTelegramAlert]);
 
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
@@ -6002,7 +6037,42 @@ export default function App() {
             {notificationPermission === "granted" ? "Phone Notifications Enabled" : "Enable Phone Notifications"}
           </button>
           <div style={{ ...subtle, marginTop: 10 }}>
-            For proper phone alerts, open the live site on your phone and allow notifications there. If the browser blocks background notifications, the next upgrade is Telegram/Pushover server push.
+            For browser phone alerts, open the live site on your phone and allow notifications there.
+          </div>
+
+          <div style={{ ...statCard, marginTop: 12, background: "#ffffff", borderColor: alertSettings.telegramEnabled ? "#99f6e4" : "#e2e8f0" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+              <div>
+                <div style={{ fontWeight: 950, color: alertSettings.telegramEnabled ? "#0f766e" : "#111827" }}>Telegram alerts</div>
+                <div style={{ ...subtle, marginTop: 5 }}>
+                  Sends top scalp alerts through the Netlify Telegram function. Needs `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+                </div>
+              </div>
+              <span style={{ ...pill, color: telegramStatus === "error" ? "#b91c1c" : telegramStatus === "sent" ? "#047857" : "#111827" }}>
+                {telegramStatus.toUpperCase()}
+              </span>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontWeight: 900, color: "#111827" }}>
+              <input type="checkbox" checked={alertSettings.telegramEnabled} onChange={(e) => setAlertSettings((s) => ({ ...s, telegramEnabled: e.target.checked }))} />
+              Send Telegram alerts
+            </label>
+            <button
+              style={telegramStatus === "sending" ? btnDisabled : btnDanger}
+              disabled={telegramStatus === "sending"}
+              onClick={() => sendTelegramAlert({
+                title: "Telegram test alert",
+                detail: "If you received this, Telegram alerts are connected. Real scalp alerts will include the coin, alert type, and reason.",
+                symbol: "TEST",
+                kind: "SCALP_TEST",
+              })}
+            >
+              {telegramStatus === "sending" ? "Sending..." : "Send Telegram Test"}
+            </button>
+            {telegramError && (
+              <div style={{ ...subtle, marginTop: 8, color: "#b91c1c" }}>
+                {telegramError}
+              </div>
+            )}
           </div>
         </div>
 
@@ -6035,6 +6105,9 @@ export default function App() {
                       }}
                     >
                       Inspect
+                    </button>
+                    <button style={btnDanger} onClick={() => sendTelegramAlert(alert)}>
+                      Telegram
                     </button>
                   </div>
                 </div>
