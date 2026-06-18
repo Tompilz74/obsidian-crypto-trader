@@ -677,6 +677,7 @@ const LS_PRO_PASS = "ob:pro-pass";
 const LS_LEADS = "ob:leads";
 const LS_SIM = "ob:simulator";
 const LS_SIM_REVOLUT_X_MODE = "ob:sim-revolut-x-mode";
+const LS_CUSTOM_REVOLUT_COINS = "ob:custom-revolut-coins";
 const LS_GOAL_PLAN = "ob:goal-plan";
 const LS_AI_SIGNALS = "ob:ai-signals";
 const LS_ALERT_SETTINGS = "ob:alert-settings";
@@ -796,6 +797,36 @@ function loadSimRevolutXMode() {
 
 function saveSimRevolutXMode(enabled: boolean) {
   localStorage.setItem(LS_SIM_REVOLUT_X_MODE, String(enabled));
+}
+
+function normalizeCoinDef(coin: Partial<CoinDef>): CoinDef | null {
+  const symbol = (coin.symbol ?? "").trim().toUpperCase();
+  const cgId = (coin.cgId ?? "").trim().toLowerCase();
+  const name = (coin.name ?? symbol).trim();
+  if (!symbol || !cgId) return null;
+  return { symbol, cgId, name: name || symbol };
+}
+
+function loadCustomRevolutCoins(): CoinDef[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LS_CUSTOM_REVOLUT_COINS) || "[]") as Partial<CoinDef>[];
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set(COINS.map((c) => c.symbol.toUpperCase()));
+    const coins: CoinDef[] = [];
+    for (const coin of parsed) {
+      const normalized = normalizeCoinDef(coin);
+      if (!normalized || seen.has(normalized.symbol)) continue;
+      seen.add(normalized.symbol);
+      coins.push(normalized);
+    }
+    return coins;
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomRevolutCoins(coins: CoinDef[]) {
+  localStorage.setItem(LS_CUSTOM_REVOLUT_COINS, JSON.stringify(coins.map(normalizeCoinDef).filter(Boolean)));
 }
 
 function goalPeriodDays(period: GoalPeriod) {
@@ -1051,7 +1082,7 @@ function evaluateStructure(lastPrice: number, levels: ReturnType<typeof computeP
 
 type CoinDef = { symbol: string; cgId?: string; name?: string };
 
-/** Original app universe plus a broader Revolut UK candidate universe (best-effort CoinGecko ids). */
+/** Original app universe plus a broader Revolut-style working universe (best-effort CoinGecko ids). */
 const BASE_COINS: CoinDef[] = [
   { symbol: "BTC", cgId: "bitcoin", name: "Bitcoin" },
   { symbol: "ETH", cgId: "ethereum", name: "Ethereum" },
@@ -1391,6 +1422,10 @@ export default function App() {
   const [simTradeMode, setSimTradeMode] = useState<SimTradeMode>("SCALP");
   const [simCoinSearch, setSimCoinSearch] = useState("");
   const [simRevolutXMode, setSimRevolutXMode] = useState(() => loadSimRevolutXMode());
+  const [customRevolutCoins, setCustomRevolutCoins] = useState<CoinDef[]>(() => loadCustomRevolutCoins());
+  const [customCoinSymbol, setCustomCoinSymbol] = useState("");
+  const [customCoinCgId, setCustomCoinCgId] = useState("");
+  const [customCoinName, setCustomCoinName] = useState("");
   const [simBuyUsd, setSimBuyUsd] = useState("250");
   const [simStopLossInput, setSimStopLossInput] = useState("");
   const [simTakeProfitInput, setSimTakeProfitInput] = useState("");
@@ -1423,6 +1458,7 @@ export default function App() {
   useEffect(() => saveDayState(dayState), [dayState]);
   useEffect(() => saveSimState(simState), [simState]);
   useEffect(() => saveSimRevolutXMode(simRevolutXMode), [simRevolutXMode]);
+  useEffect(() => saveCustomRevolutCoins(customRevolutCoins), [customRevolutCoins]);
   useEffect(() => saveGoalPlan(goalPlan), [goalPlan]);
   useEffect(() => saveAiSignals(aiSignals), [aiSignals]);
   useEffect(() => saveAlertSettings(alertSettings), [alertSettings]);
@@ -1432,7 +1468,16 @@ export default function App() {
   const localTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const sessionInfo = computeSession(new Date());
 
-  const coinIds = useMemo(() => COINS.map((c) => c.cgId).filter(Boolean) as string[], []);
+  const allCoins = useMemo(() => {
+    const bySymbol = new Map<string, CoinDef>();
+    for (const coin of [...COINS, ...customRevolutCoins]) {
+      const normalized = normalizeCoinDef(coin);
+      if (normalized) bySymbol.set(normalized.symbol, normalized);
+    }
+    return [...bySymbol.values()];
+  }, [customRevolutCoins]);
+
+  const coinIds = useMemo(() => allCoins.map((c) => c.cgId).filter(Boolean) as string[], [allCoins]);
 
   const refresh = async () => {
     setIsLoading(true);
@@ -1441,7 +1486,7 @@ export default function App() {
       const rows = await fetchCoinGeckoMarketsBatched(coinIds);
       const byId = new Map(rows.map((r) => [r.id, r]));
 
-      const merged: MarketRow[] = COINS.map((c) => {
+      const merged: MarketRow[] = allCoins.map((c) => {
         const r = c.cgId ? byId.get(c.cgId) : undefined;
         return {
           symbol: c.symbol.toUpperCase(),
@@ -1591,7 +1636,7 @@ export default function App() {
 
   useEffect(() => {
     if (!simSymbol || priceHistoryMap[simSymbol]?.length) return;
-    const coin = COINS.find((c) => c.symbol.toUpperCase() === simSymbol);
+    const coin = allCoins.find((c) => c.symbol.toUpperCase() === simSymbol);
     if (!coin?.cgId) return;
 
     let cancelled = false;
@@ -1608,7 +1653,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [priceHistoryMap, simSymbol]);
+  }, [allCoins, priceHistoryMap, simSymbol]);
 
   const commitRequired = !commit || commit.dayKey !== todayKey;
 
@@ -1693,18 +1738,18 @@ export default function App() {
     () =>
       market.length
         ? market
-        : COINS.map((c) => ({
+        : allCoins.map((c) => ({
             symbol: c.symbol.toUpperCase(),
             cgId: c.cgId,
             name: c.name,
           })),
-    [market]
+    [allCoins, market]
   );
   const universeStats = useMemo(() => {
     const live = marketUniverse.filter((m) => typeof m.priceUsd === "number" && isFinite(m.priceUsd)).length;
-    const missing = Math.max(0, COINS.length - live);
-    return { total: COINS.length, live, missing };
-  }, [marketUniverse]);
+    const missing = Math.max(0, allCoins.length - live);
+    return { total: allCoins.length, live, missing, custom: customRevolutCoins.length };
+  }, [allCoins.length, customRevolutCoins.length, marketUniverse]);
 
   const filteredMarket = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -2032,8 +2077,8 @@ export default function App() {
 
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
-    const revolutSymbols = new Set(COINS.map((c) => c.symbol.toUpperCase()));
-    const base = setups.length ? setups : COINS.map((c) => ({
+    const revolutSymbols = new Set(allCoins.map((c) => c.symbol.toUpperCase()));
+    const base = setups.length ? setups : allCoins.map((c) => ({
       symbol: c.symbol,
       priceUsd: undefined,
       change24h: undefined,
@@ -2051,7 +2096,7 @@ export default function App() {
     return base
       .filter((s) => !simRevolutXMode || revolutSymbols.has(s.symbol.toUpperCase()))
       .filter((s) => !q || s.symbol.toLowerCase().includes(q));
-  }, [setups, simCoinSearch, simRevolutXMode]);
+  }, [allCoins, setups, simCoinSearch, simRevolutXMode]);
   const estimateSimExit = useCallback((position: SimPosition, exit: number) => {
     const grossValue = exit * position.qty;
     const grossPnlUsd = grossValue - position.notionalUsd;
@@ -3003,6 +3048,28 @@ export default function App() {
     setNotificationPermission(permission);
   };
 
+  const addCustomRevolutCoin = () => {
+    const coin = normalizeCoinDef({ symbol: customCoinSymbol, cgId: customCoinCgId, name: customCoinName || customCoinSymbol });
+    if (!coin) {
+      alert("Enter at least a symbol and CoinGecko ID, e.g. SYN / synapse-2.");
+      return;
+    }
+    const exists = allCoins.some((c) => c.symbol.toUpperCase() === coin.symbol);
+    if (exists) {
+      alert(`${coin.symbol} is already in the app universe.`);
+      return;
+    }
+    setCustomRevolutCoins((coins) => [...coins, coin].sort((a, b) => a.symbol.localeCompare(b.symbol)));
+    setCustomCoinSymbol("");
+    setCustomCoinCgId("");
+    setCustomCoinName("");
+    setSimCoinSearch(coin.symbol);
+  };
+
+  const removeCustomRevolutCoin = (symbol: string) => {
+    setCustomRevolutCoins((coins) => coins.filter((coin) => coin.symbol.toUpperCase() !== symbol.toUpperCase()));
+  };
+
   const exportJournalCsv = () => {
     const header = "time,symbol,side,entry,stop,exit,r,rules_followed,note";
     const lines = dayState.trades.map((t) =>
@@ -3808,10 +3875,10 @@ export default function App() {
             <div>
               <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
               <div style={{ ...subtle, marginTop: 4 }}>
-                Revolut UK candidate universe: {universeStats.total} coins · live data {universeStats.live} · missing {universeStats.missing}
+                Revolut X working universe: {universeStats.total} coins · custom {universeStats.custom} · live data {universeStats.live} · missing {universeStats.missing}
               </div>
             </div>
-            <span style={pill}>UK universe</span>
+            <span style={pill}>Working universe</span>
           </div>
 
           <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -5280,7 +5347,7 @@ export default function App() {
             <div>
               <div style={sectionTitle}>SCANNER UNIVERSE</div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                Revolut UK candidate universe: {universeStats.total} coins. Live data loaded for {universeStats.live}; missing entries stay visible for cleanup.
+                Revolut X working universe: {universeStats.total} coins including {universeStats.custom} custom additions. Live data loaded for {universeStats.live}; missing entries stay visible for cleanup.
               </div>
             </div>
             <input
@@ -5289,6 +5356,43 @@ export default function App() {
               value={simCoinSearch}
               onChange={(e) => setSimCoinSearch(e.target.value)}
             />
+          </div>
+
+          <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
+            <div style={{ fontWeight: 950, color: "#111827" }}>Add missing Revolut X coin</div>
+            <div style={{ ...subtle, marginTop: 5 }}>
+              Add the symbol and CoinGecko ID from the coin page URL. Example: SYN uses <b>synapse-2</b>.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "0.6fr 1fr 1fr auto", gap: 8, marginTop: 10 }}>
+              <input
+                style={input}
+                value={customCoinSymbol}
+                onChange={(e) => setCustomCoinSymbol(e.target.value.toUpperCase())}
+                placeholder="Symbol"
+              />
+              <input
+                style={input}
+                value={customCoinCgId}
+                onChange={(e) => setCustomCoinCgId(e.target.value.toLowerCase())}
+                placeholder="CoinGecko ID"
+              />
+              <input
+                style={input}
+                value={customCoinName}
+                onChange={(e) => setCustomCoinName(e.target.value)}
+                placeholder="Name optional"
+              />
+              <button style={btn} onClick={addCustomRevolutCoin}>Add</button>
+            </div>
+            {customRevolutCoins.length > 0 && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+                {customRevolutCoins.map((coin) => (
+                  <button key={coin.symbol} style={{ ...pill, cursor: "pointer", color: "#0f766e" }} onClick={() => removeCustomRevolutCoin(coin.symbol)}>
+                    {coin.symbol} ×
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10, marginTop: 12, maxHeight: 520, overflow: "auto", paddingRight: 4 }}>
