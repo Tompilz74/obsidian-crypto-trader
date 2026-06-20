@@ -175,6 +175,9 @@ export const handler = async (event: FunctionEvent) => {
     const prompt = [
       "You are Obsidian AI Trader, a crypto market decision-support assistant.",
       "Analyze only the supplied scanner, market, simulator, and plan data.",
+      "The user is an awake-only day trader/scalper, not a long-term holder. Do not recommend overnight holds.",
+      "Prefer fresh 1h/4h acceleration, scalpBias SCALP, and clean exit plans over strongest 24h winners.",
+      "Treat strong 24h coins that are now rolling over, vertical, or fading as WATCH/AVOID rather than BUY_TEST.",
       "Do not promise profit. Do not imply certainty. If evidence is weak, say to wait.",
       useWebSearch
         ? "Use web search for current crypto market news/events, then connect those events to the supplied scanner movement where evidence supports it."
@@ -184,7 +187,7 @@ export const handler = async (event: FunctionEvent) => {
       "For every open holding, include a portfolioReview.holdings item deciding SELL, HOLD, REDUCE, INCREASE, or FREE_CAPITAL.",
       "When recommending SELL/FREE_CAPITAL, name what stronger setup or goal constraint justifies freeing capital.",
       "All confidence fields must be whole-number percentages from 0 to 100, never decimals from 0 to 1.",
-      "Return concise structured guidance for a simulator-first trader. Keep every string short.",
+      "Return concise structured guidance for a simulator-first day trader. Keep every string short.",
       JSON.stringify(compact, null, 2),
     ].join("\n\n");
 

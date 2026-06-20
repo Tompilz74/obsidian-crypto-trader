@@ -39,6 +39,7 @@ type MarketRow = {
 type SetupRow = {
   symbol: string;
   combinedScore: number;
+  dayTradeScore: number;
   score15m: number;
   score1h: number;
   volFactor: number;
@@ -53,6 +54,12 @@ type SetupRow = {
   ret4h?: number;
   dropFromHigh6h?: number;
   spikeFromLow6h?: number;
+  path1h?: number;
+  path4h?: number;
+  path24h?: number;
+  pathLabel?: PathMomentum["label"];
+  verticalRisk?: number;
+  scalpBias: "SCALP" | "WATCH" | "AVOID";
 
   // Phase 3: structure engine
   structureLabel: "OK" | "WAIT" | "NO_EDGE";
@@ -658,6 +665,54 @@ function scoreSetup(row: MarketRow, baselineVol: number) {
   return { combinedScore: combined, score15m, score1h, volFactor, why };
 }
 
+function scoreDayTradeSetup(row: MarketRow, base: ReturnType<typeof scoreSetup>, micro?: MicroMetrics, path?: PathMomentum) {
+  const ch = row.change24h ?? 0;
+  const ret1h = micro?.ret1h ?? path?.path1h ?? ch * 0.08;
+  const ret4h = micro?.ret4h ?? path?.path4h ?? ch * 0.22;
+  const drop = micro?.dropFromHigh6h ?? path?.pullbackPct ?? 0;
+  const spike = micro?.spikeFromLow6h ?? Math.max(0, ret4h);
+  const verticalRisk = path?.verticalRisk ?? 0;
+  const pathLabel = path?.label ?? "NO PATH";
+  const acceleration = ret1h - ret4h / 4;
+  const freshPositive = ret1h > 0.08 && ret4h > -0.2;
+  const rollingOver = ret1h <= -0.05 || drop <= -2.2 || (spike >= 6 && acceleration <= 0.04);
+  const strongButLate = ch >= 10 && (rollingOver || verticalRisk >= 62);
+  const noMovement = Math.abs(ch) < 0.8 && Math.abs(ret1h) < 0.08 && Math.abs(ret4h) < 0.35;
+
+  const dayTradeScore = Math.round(clamp(
+    base.combinedScore * 0.32 +
+      Math.max(0, ret1h) * 18 +
+      Math.max(0, ret4h) * 5 +
+      Math.max(0, acceleration) * 18 +
+      Math.log10(Math.max(1, base.volFactor)) * 24 +
+      (pathLabel === "LIFTING" ? 18 : pathLabel === "BUILDING" ? 10 : pathLabel === "VERTICAL" ? -16 : 0) -
+      Math.max(0, -ret1h) * 28 -
+      Math.max(0, -drop - 1.5) * 10 -
+      verticalRisk * 0.26 -
+      (strongButLate ? 20 : 0) -
+      (noMovement ? 24 : 0),
+    0,
+    100
+  ));
+
+  const scalpBias: SetupRow["scalpBias"] =
+    noMovement || rollingOver || strongButLate || micro?.entryQuality === "NO_EDGE"
+      ? "AVOID"
+      : dayTradeScore >= 68 && freshPositive
+        ? "SCALP"
+        : "WATCH";
+
+  const why: string[] = [];
+  if (freshPositive) why.push(`Fresh 1h ${ret1h >= 0 ? "+" : ""}${ret1h.toFixed(2)}%`);
+  if (acceleration > 0.05) why.push(`Acceleration +${acceleration.toFixed(2)}`);
+  if (pathLabel === "LIFTING" || pathLabel === "BUILDING") why.push(`Path ${pathLabel}`);
+  if (rollingOver) why.push("Rolling over now");
+  if (strongButLate) why.push("Strong 24h, but late/vertical");
+  if (noMovement) why.push("No useful movement");
+
+  return { dayTradeScore, scalpBias, why };
+}
+
 /** Compute R multiple */
 function computeR(side: "LONG" | "SHORT", entry: number, stop: number, exit: number) {
   if (![entry, stop, exit].every((x) => typeof x === "number" && isFinite(x))) return NaN;
@@ -903,7 +958,7 @@ function strategyFromGoal(targetReturnPct: number, targetPeriod: GoalPeriod): {
       maxOpenPositions: 2,
       riskPerTradePct: 1,
       minConfidence: 76,
-      notes: "Active day-trading target. Focus on VALID timing, Structure OK, and close positions before sleep unless they are deliberately moved into the long-term study lane.",
+      notes: "Active day-trading target. Focus on fresh scalp momentum, VALID timing, Structure OK, and close positions before sleep unless you deliberately accept overnight risk.",
     };
   }
 
@@ -1559,29 +1614,34 @@ export default function App() {
         return vols.length ? vols[Math.floor(vols.length / 2)] : 1;
       })();
 
-      // Rank top candidates (limit work: <= 10)
+      // Rank top candidates for deeper checks without over-weighting stale 24h winners.
       const rankedTemp = merged
         .map((m) => {
           const s = scoreSetup(m, baselineVolTemp);
-          return { symbol: m.symbol, cgId: m.cgId, combined: s.combinedScore };
+          const ch = m.change24h ?? 0;
+          const active = Math.abs(ch) >= 0.8 && (m.volume24hUsd ?? 0) > 0;
+          const priority = s.combinedScore + Math.max(0, ch) * 0.8 + (active ? 8 : -18);
+          return { symbol: m.symbol, cgId: m.cgId, combined: priority };
         })
         .filter((x) => !!x.cgId)
         .sort((a, b) => b.combined - a.combined)
-        .slice(0, 10);
+        .slice(0, 18);
 
       const scalpRankedTemp = merged
         .map((m) => {
           const vol = m.volume24hUsd ?? 0;
           const volFactor = baselineVolTemp > 0 ? vol / baselineVolTemp : 1;
           const ch = m.change24h ?? 0;
-          const positiveTape = Math.max(0, ch);
-          const earlyTape = ch > -1 ? 8 : 0;
-          const scalpPriority = positiveTape * 7.5 + Math.log10(Math.max(1, volFactor)) * 32 + earlyTape;
+          const activeTape = Math.abs(ch) >= 0.8 ? 10 : -10;
+          const positiveTape = clamp(Math.max(0, ch), 0, 18);
+          const notTooVertical = ch <= 28 ? 8 : -10;
+          const earlyTape = ch > -1 ? 8 : -8;
+          const scalpPriority = positiveTape * 5.8 + Math.log10(Math.max(1, volFactor)) * 38 + earlyTape + activeTape + notTooVertical;
           return { symbol: m.symbol, cgId: m.cgId, scalpPriority };
         })
-        .filter((x) => !!x.cgId && x.scalpPriority > 7)
+        .filter((x) => !!x.cgId && x.scalpPriority > 5)
         .sort((a, b) => b.scalpPriority - a.scalpPriority)
-        .slice(0, 34);
+        .slice(0, 70);
 
       // ---- Phase 2B: micro entry-quality (CoinGecko hourly)
       try {
@@ -1605,7 +1665,7 @@ export default function App() {
 
       // ---- Quick scalp micro refresh: prioritize fresh 1h/4h acceleration for fast movers
       try {
-        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 22);
+        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 42);
         const scalpPairs = await Promise.all(
           scalpTargets.map(async (x) => {
             const prices = await fetchCoinGeckoHourly24h(x.cgId!);
@@ -1833,6 +1893,8 @@ export default function App() {
       .map((m) => {
         const s = scoreSetup(m, baselineVol || 1);
         const micro = microMap[m.symbol];
+        const path = computePathMomentum(priceHistoryMap[m.symbol] ?? []);
+        const dayTrade = scoreDayTradeSetup(m, s, micro, path);
         const st = structMap[m.symbol];
 
         return {
@@ -1840,10 +1902,11 @@ export default function App() {
           priceUsd: m.priceUsd,
           change24h: m.change24h,
           combinedScore: s.combinedScore,
+          dayTradeScore: dayTrade.dayTradeScore,
           score15m: s.score15m,
           score1h: s.score1h,
           volFactor: s.volFactor,
-          why: s.why,
+          why: [...dayTrade.why, ...s.why],
 
           entryQuality: micro?.entryQuality ?? "VALID",
           whyNot: micro?.whyNot ?? [],
@@ -1851,6 +1914,12 @@ export default function App() {
           ret4h: micro?.ret4h,
           dropFromHigh6h: micro?.dropFromHigh6h,
           spikeFromLow6h: micro?.spikeFromLow6h,
+          path1h: path.path1h,
+          path4h: path.path4h,
+          path24h: path.path24h,
+          pathLabel: path.label,
+          verticalRisk: path.verticalRisk,
+          scalpBias: dayTrade.scalpBias,
 
           structureLabel: st?.label ?? "WAIT",
           structureWhy: st?.reasons ?? (st ? [] : ["Structure not loaded yet."]),
@@ -1860,16 +1929,17 @@ export default function App() {
           structureSource: st?.source ?? "MISSING",
         };
       })
-      .sort((a, b) => b.combinedScore - a.combinedScore);
-  }, [filteredMarket, baselineVol, microMap, structMap]);
+      .sort((a, b) => b.dayTradeScore - a.dayTradeScore);
+  }, [filteredMarket, baselineVol, microMap, priceHistoryMap, structMap]);
 
-  // Strict: best list only includes VALID entry-quality AND Structure OK
+  // Strict: day-trade list only includes fresh, scalp-biased setups with structure.
   const scannerBest = useMemo(
     () =>
       setups
         .filter((s) => s.entryQuality === "VALID")
         .filter((s) => s.structureLabel === "OK")
-        .filter((s) => s.combinedScore >= 70 && s.score1h >= 65 && s.volFactor >= 1.3)
+        .filter((s) => s.scalpBias === "SCALP")
+        .filter((s) => s.dayTradeScore >= 68 && s.volFactor >= 1.15)
         .slice(0, 8),
     [setups]
   );
@@ -1884,7 +1954,7 @@ export default function App() {
     const tradable = scannerBest.length;
     const scanned = setups.length;
     const blocked = blockedSetups.length;
-    const avgScore = scanned ? setups.reduce((acc, s) => acc + s.combinedScore, 0) / scanned : 0;
+    const avgScore = scanned ? setups.reduce((acc, s) => acc + s.dayTradeScore, 0) / scanned : 0;
     return { tradable, scanned, blocked, avgScore };
   }, [blockedSetups.length, scannerBest.length, setups]);
   const edgeGrade = useMemo(() => {
@@ -2196,17 +2266,26 @@ export default function App() {
   const simCoinChoices = useMemo(() => {
     const q = simCoinSearch.trim().toLowerCase();
     const revolutSymbols = new Set(allCoins.map((c) => c.symbol.toUpperCase()));
-    const base = setups.length ? setups : allCoins.map((c) => ({
+    const base: SetupRow[] = setups.length ? setups : allCoins.map((c) => ({
       symbol: c.symbol,
       priceUsd: undefined,
       change24h: undefined,
       combinedScore: 0,
+      dayTradeScore: 0,
       score15m: 0,
       score1h: 0,
       volFactor: 0,
       why: [],
       entryQuality: "VALID" as const,
       whyNot: [],
+      ret1h: undefined,
+      ret4h: undefined,
+      path1h: 0,
+      path4h: 0,
+      path24h: 0,
+      pathLabel: "NO PATH" as const,
+      verticalRisk: 0,
+      scalpBias: "WATCH" as const,
       structureLabel: "WAIT" as const,
       structureWhy: ["Live scanner data loading."],
       structureSource: "MISSING" as const,
@@ -2353,11 +2432,11 @@ export default function App() {
       .slice(0, 24)
       .map((s) => {
         const micro = microMap[s.symbol];
-        const strict = s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70;
+        const strict = s.entryQuality === "VALID" && s.structureLabel === "OK" && s.scalpBias === "SCALP" && s.dayTradeScore >= 68;
         const proxyReturnPct = micro?.ret4h ?? (s.change24h ?? 0) * 0.18;
         const afterCostsPct = proxyReturnPct - (simRevolutXMode ? simBreakEvenMovePct : REVOLUT_X_ROUND_TRIP_FEE_PCT);
         const result = strict ? afterCostsPct : 0;
-        return { symbol: s.symbol, strict, score: s.combinedScore, proxyReturnPct, afterCostsPct, result };
+        return { symbol: s.symbol, strict, score: s.dayTradeScore, proxyReturnPct, afterCostsPct, result };
       });
     const trades = rows.filter((r) => r.strict);
     const wins = trades.filter((r) => r.result > 0).length;
@@ -2407,16 +2486,17 @@ export default function App() {
   }, [goalPlan, simEquity, simState.startingCashUsd, todaySimProgress.basis, todaySimProgress.pnlUsd]);
 
   const advancedAi = useMemo(() => {
-    const score = simSelectedSetup?.combinedScore ?? 0;
+    const score = simSelectedSetup?.dayTradeScore ?? simSelectedSetup?.combinedScore ?? 0;
     const entryOk = simSelectedSetup?.entryQuality === "VALID";
     const structureOk = simSelectedSetup?.structureLabel === "OK";
+    const scalpOk = simSelectedSetup?.scalpBias === "SCALP";
     const hasPrice = simCanBuySelected;
     const minConfidence = goalPlan?.minConfidence ?? 70;
     const maxOpenPositions = goalPlan?.maxOpenPositions ?? 3;
     const maxDailyLossPct = goalPlan?.maxDailyLossPct ?? 3;
     const tradablePressure = watchlistHealth.scanned ? watchlistHealth.tradable / watchlistHealth.scanned : 0;
     const rawConfidence = clamp(
-      Math.round(score * 0.46 + (entryOk ? 18 : -14) + (structureOk ? 20 : -18) + tradablePressure * 12 + (hasPrice ? 4 : 0)),
+      Math.round(score * 0.5 + (scalpOk ? 18 : -18) + (entryOk ? 12 : -14) + (structureOk ? 12 : -12) + tradablePressure * 10 + (hasPrice ? 4 : 0)),
       0,
       100
     );
@@ -2451,13 +2531,14 @@ export default function App() {
     if (planProgress.status === "GOAL HIT") blockers.push("Goal target already hit. Protect the result instead of forcing more trades.");
     if (planProgress.status === "STOP HIT") blockers.push("Plan loss cap is hit. Stop trading and review.");
     if (!hasPrice) blockers.push("No live price available for this coin.");
+    if (!scalpOk) blockers.push("Coin is not showing fresh scalp momentum; avoid treating an old 24h winner as a buy.");
     if (!entryOk) blockers.push("Entry quality is not valid; avoid chasing or catching a fast dump.");
     if (!structureOk) blockers.push("Structure does not have a clean 2R map.");
     if (confidence < minConfidence) blockers.push(`AI confidence is below your plan minimum of ${minConfidence}%.`);
     if (riskState === "RED") blockers.push("Simulator drawdown guard is active; stop trading and review.");
     if (simState.positions.length >= maxOpenPositions) blockers.push(`Plan allows only ${maxOpenPositions} open sim holding${maxOpenPositions === 1 ? "" : "s"}.`);
     if (simSelectedHolding && simSelectedHoldingPnl < 0) blockers.push(`Already holding losing ${simSymbol}; do not average down.`);
-    const shouldTrade = blockers.length === 0 && scannerEdgePct > 0.2;
+    const shouldTrade = blockers.length === 0 && scannerEdgePct > 0.2 && scalpOk;
     const executionRules = [
       goalPlan ? `${goalPlan.strategyProfile}: +${goalPlan.targetReturnPct.toFixed(2)}% per ${goalPlan.targetPeriod}` : "Create and accept a goal plan first",
       `Max sim size: ${fmtUsd(maxTradeUsd)}`,
@@ -2506,12 +2587,15 @@ export default function App() {
   const aiTradeBrief = useMemo(() => {
     const entryOk = simSelectedSetup?.entryQuality === "VALID";
     const structureOk = simSelectedSetup?.structureLabel === "OK";
+    const scalpOk = simSelectedSetup?.scalpBias === "SCALP";
     const hasPrice = simCanBuySelected;
     const hasHolding = !!simSelectedHolding;
     const confidence = advancedAi.confidence;
 
     const reasons: string[] = [];
     if (!hasPrice) reasons.push("Waiting for live market price before simulation can buy.");
+    if (scalpOk) reasons.push("Fresh scalp momentum is active.");
+    else reasons.push("Not a fresh scalp setup; do not buy just because the 24h move is large.");
     if (entryOk) reasons.push("Entry quality is valid; no fast dump/chase flag active.");
     else reasons.push(`Entry quality is ${simSelectedSetup?.entryQuality ?? "loading"}; be careful with timing.`);
     if (structureOk) reasons.push("Structure check is OK with a cleaner 2R map.");
@@ -2552,18 +2636,25 @@ export default function App() {
       : advancedAi.blockers[0] ?? "setup does not have enough estimated edge.";
 
   const aiAdvice = useMemo(() => {
+    const scalpCandidate =
+      selectedScalpSignal?.action === "SCALP_TEST"
+        ? selectedScalpSignal.setup
+        : scalpSignals.find((s) => s.action === "SCALP_TEST" && s.legsScore >= 58 && s.peakRiskScore < 58)?.setup;
     const candidate =
+      scalpCandidate ??
       scannerBest[0] ??
-      setups.find((s) => s.entryQuality === "VALID" && s.structureLabel !== "NO_EDGE" && s.combinedScore >= 65) ??
+      setups.find((s) => s.entryQuality === "VALID" && s.scalpBias !== "AVOID" && s.dayTradeScore >= 62) ??
       setups[0];
     const symbol = candidate?.symbol ?? simSymbol;
     const price = (candidate ? getSimPrice(candidate.symbol) || candidate.priceUsd : 0) || 0;
     const strict = !!candidate && scannerBest.some((s) => s.symbol === candidate.symbol);
     const validTiming = candidate?.entryQuality === "VALID";
     const validStructure = candidate?.structureLabel === "OK";
+    const scalpReady = scalpSignals.some((s) => s.symbol === symbol && s.action === "SCALP_TEST" && s.legsScore >= 55 && s.peakRiskScore < 62);
+    const fading = candidate?.scalpBias === "AVOID" || (candidate?.ret1h ?? 0) <= -0.05;
     const sessionOk = sessionInfo.status !== "WAIT" || overrideGuard;
     const confidence = clamp(
-      Math.round((candidate?.combinedScore ?? 0) * 0.5 + (validTiming ? 18 : -12) + (validStructure ? 18 : -16) + (sessionOk ? 8 : -10)),
+      Math.round((candidate?.dayTradeScore ?? 0) * 0.58 + (scalpReady ? 18 : -10) + (validTiming ? 12 : -12) + (validStructure ? 10 : -8) + (sessionOk ? 6 : -8) - (fading ? 20 : 0)),
       0,
       100
     );
@@ -2574,27 +2665,25 @@ export default function App() {
     const stop = candidate?.support ?? (price ? price * (1 - stopPctForAdvice / 100) : 0);
     const target = candidate?.resistance ?? (price ? price * (1 + targetPctForAdvice / 100) : 0);
     const holdWindow =
-      strict && confidence >= 78
-        ? (candidate?.change24h ?? 0) >= 5
-          ? "30 minutes to 3 hours, then reassess momentum."
-          : "2 to 8 hours, unless target/stop hits first."
-        : "Do not hold. Wait for a cleaner scanner pass.";
+      strict && confidence >= 78 && scalpReady
+        ? "2 to 30 minutes. Exit at stop/target or if momentum fades."
+        : "Do not hold. Wait for a cleaner scalp pass.";
     const action =
-      strict && sessionOk && confidence >= 78
+      strict && sessionOk && confidence >= 78 && scalpReady && !fading
         ? "BUY TEST"
-        : validTiming && confidence >= 62
+        : validTiming && confidence >= 62 && !fading
           ? "WAIT FOR CONFIRMATION"
           : "DO NOT BUY";
     const when =
       action === "BUY TEST"
-        ? "Buy in the simulator only if price stays inside the entry zone and the scanner still says VALID + Structure OK."
+        ? "Buy in the simulator only if scalp signal still says SCALP TEST and price has not gone vertical."
         : action === "WAIT FOR CONFIRMATION"
-          ? "Wait for Structure OK, confidence above 78%, and no fresh dump/chase warning."
+          ? "Wait for SCALP TEST, fresh 1h/4h lift, and no fading/peak-risk warning."
           : "Skip it until the scanner produces a strict candidate.";
     const invalidation = [
       `Price loses stop area near ${fmtUsd(stop)}.`,
       "Entry quality flips away from VALID.",
-      "Structure loses 2R room or turns NO EDGE.",
+      "Scalp signal fades, turns PEAK RISK, or loses 2R room.",
       "You already have 3 open holdings or hit your daily loss limit.",
     ];
     return {
@@ -2612,7 +2701,7 @@ export default function App() {
       invalidation,
       loadable: !!candidate,
     };
-  }, [getSimPrice, overrideGuard, scannerBest, sessionInfo.status, setups, simSymbol]);
+  }, [getSimPrice, overrideGuard, scannerBest, scalpSignals, selectedScalpSignal, sessionInfo.status, setups, simSymbol]);
 
   const holdingReviews = useMemo(() => {
     const drawdownPct = ((simEquity - simState.startingCashUsd) / simState.startingCashUsd) * 100;
@@ -2625,8 +2714,8 @@ export default function App() {
       const pnlPct = exitResult.pnlPct;
       const ageHours = Math.max(0, (Date.now() - new Date(p.openedAtIso).getTime()) / (60 * 60 * 1000));
       const setup = setups.find((s) => s.symbol === p.symbol);
-      const strict = !!setup && setup.entryQuality === "VALID" && setup.structureLabel === "OK" && setup.combinedScore >= 70;
-      const weakSetup = !setup || setup.entryQuality === "NO_EDGE" || setup.structureLabel === "NO_EDGE";
+      const strict = !!setup && setup.entryQuality === "VALID" && setup.structureLabel === "OK" && setup.scalpBias === "SCALP" && setup.dayTradeScore >= 68;
+      const weakSetup = !setup || setup.entryQuality === "NO_EDGE" || setup.structureLabel === "NO_EDGE" || setup.scalpBias === "AVOID" || (setup.ret1h ?? 0) <= -0.05;
       const hitStop = typeof p.stop === "number" && now <= p.stop;
       const hitTarget = typeof p.takeProfit === "number" && now >= p.takeProfit;
       const isScalp = p.mode === "SCALP" || p.source.startsWith("SCALP");
@@ -2645,6 +2734,10 @@ export default function App() {
         action = "SELL";
         tone = "#b91c1c";
         reasons.push("Scalp has gone stale; close it while you are awake instead of letting it become a hold.");
+      } else if (isScalp && weakSetup) {
+        action = "SELL";
+        tone = "#b91c1c";
+        reasons.push("Scalp setup has faded or flipped to avoid; close or tighten the exit.");
       } else if (hitStop) {
         action = "SELL";
         tone = "#b91c1c";
@@ -2666,14 +2759,14 @@ export default function App() {
         tone = "#047857";
         reasons.push("Position is working and scanner still supports the setup.");
       } else {
-        reasons.push(strict ? "Hold while scanner remains VALID + Structure OK." : "Hold only if your original thesis is still intact.");
+        reasons.push(strict ? "Hold only while fresh scalp momentum remains active." : "Hold only if your original day-trade thesis is still intact.");
       }
 
       if (isScalp && ageHours >= 0.25) reasons.push("Scalp review timer active: either target, stop, or close manually.");
-      if (!isScalp && ageHours >= 8 && pnlPct < 1) reasons.push("Long-term study hold with weak progress; consider freeing capital.");
+      if (!isScalp && ageHours >= 4 && pnlPct < 1) reasons.push("Manual day trade is stale; consider freeing capital before it becomes an overnight hold.");
       if (simState.positions.length >= 3) reasons.push("Portfolio already has max open holdings; no adding.");
       if (drawdownPct <= -1.5) reasons.push("Account drawdown guard is active; no adding.");
-      if (bestAlternative && (!setup || bestAlternative.combinedScore - setup.combinedScore >= 12) && pnlPct < 1.25) {
+      if (bestAlternative && (!setup || bestAlternative.dayTradeScore - setup.dayTradeScore >= 12) && pnlPct < 1.25) {
         if (action !== "SELL") {
           action = "SELL";
           tone = "#b91c1c";
@@ -2767,7 +2860,7 @@ export default function App() {
       return { label, rows, count: rows.length, wins: wins.length, losses: losses.length, pnlUsd, winRate: rows.length ? (wins.length / rows.length) * 100 : 0, expectancyPct, avgWinPct, avgLossPct };
     };
 
-    const normal = summarize("Long-term study", trades.filter((t) => t.mode !== "SCALP" && !t.source.startsWith("SCALP")));
+    const normal = summarize("Manual day trade", trades.filter((t) => t.mode !== "SCALP" && !t.source.startsWith("SCALP")));
     const scalp = summarize("Quick scalp", trades.filter((t) => t.mode === "SCALP" || t.source.startsWith("SCALP")));
     const all = summarize(recent.length ? "Last 3 days" : "All sim data", trades);
     const stopLosses = trades.filter((t) => t.exitReason === "STOP_LOSS");
@@ -2797,8 +2890,8 @@ export default function App() {
     if (scalp.count >= 2 && normal.count >= 2) {
       recommendations.push(
         scalp.expectancyPct > normal.expectancyPct
-          ? `Quick scalp is currently outperforming long-term study trades by ${(scalp.expectancyPct - normal.expectancyPct).toFixed(2)}% expectancy; keep size small but prioritize SCALP TEST cards.`
-          : `Long-term study trades are outperforming quick scalps by ${(normal.expectancyPct - scalp.expectancyPct).toFixed(2)}% expectancy; reduce scalp size or require burst score 80+.`
+          ? `Quick scalp is currently outperforming manual day trades by ${(scalp.expectancyPct - normal.expectancyPct).toFixed(2)}% expectancy; keep size small but prioritize SCALP TEST cards.`
+          : `Manual day trades are outperforming quick scalps by ${(normal.expectancyPct - scalp.expectancyPct).toFixed(2)}% expectancy; reduce scalp size or require burst score 80+.`
       );
     }
     if (stopLosses.length > takeProfits.length && trades.length >= 3) recommendations.push("More stops than targets are being hit; require cleaner entry timing and avoid buying if price is already extended.");
@@ -2839,9 +2932,14 @@ export default function App() {
     try {
       const slimSetup = (s: SetupRow) => ({
         symbol: s.symbol,
-        score: Math.round(s.combinedScore),
+        score: Math.round(s.dayTradeScore),
+        legacyScore: Math.round(s.combinedScore),
         priceUsd: s.priceUsd,
         change24h: s.change24h,
+        ret1h: s.ret1h,
+        ret4h: s.ret4h,
+        pathLabel: s.pathLabel,
+        scalpBias: s.scalpBias,
         volumeFactor: Number(s.volFactor.toFixed(2)),
         entryQuality: s.entryQuality,
         structureLabel: s.structureLabel,
@@ -2894,7 +2992,7 @@ export default function App() {
               action: idea.action,
               confidence: confidencePct(idea.confidence),
               entry: getSimPrice(idea.symbol.toUpperCase()) || setup?.priceUsd || 0,
-              score: setup?.combinedScore ?? 0,
+              score: setup?.dayTradeScore ?? setup?.combinedScore ?? 0,
               verdict: "OPEN" as const,
             };
           }),
@@ -2970,7 +3068,7 @@ export default function App() {
           simTradeMode === "SCALP" && selectedScalpSignal
             ? `SCALP / ${selectedScalpSignal.action} / ${selectedScalpSignal.burstScore}`
             : setup
-              ? `${setup.entryQuality} / ${setup.structureLabel} / ${Math.round(setup.combinedScore)}`
+              ? `${setup.entryQuality} / ${setup.structureLabel} / ${setup.scalpBias} / ${Math.round(setup.dayTradeScore)}`
               : edgeGrade.label
         }`,
     };
@@ -3051,6 +3149,7 @@ export default function App() {
     // Hard blocks:
     if (s.entryQuality === "NO_EDGE") return false;
     if (s.structureLabel !== "OK") return false;
+    if (s.scalpBias === "AVOID") return false;
 
     return true;
   };
@@ -3513,18 +3612,18 @@ export default function App() {
     let border = "rgba(255, 90, 90, 0.35)";
     let shadow = "none";
 
-    if (s.combinedScore >= 80) {
+    if (s.dayTradeScore >= 80) {
       bg = "rgba(212, 198, 161, 0.45)";
       border = "rgba(212, 198, 161, 0.85)";
       shadow = "0 0 22px rgba(212, 198, 161, 0.25)";
-    } else if (s.combinedScore >= 65) {
+    } else if (s.dayTradeScore >= 65) {
       bg = "rgba(40, 120, 70, 0.50)";
       border = "rgba(70, 220, 140, 0.35)";
       shadow = "0 0 18px rgba(70, 220, 140, 0.12)";
     }
 
     const allowed = coinActionAllowed(s);
-    const blocked = !overrideGuard && (s.entryQuality === "NO_EDGE" || s.structureLabel !== "OK");
+    const blocked = !overrideGuard && (s.entryQuality === "NO_EDGE" || s.structureLabel !== "OK" || s.scalpBias === "AVOID");
 
     return (
       <div
@@ -3548,9 +3647,7 @@ export default function App() {
           opacity: allowed ? 1 : 0.55,
           position: "relative",
         }}
-        title={
-          blocked ? "Blocked: needs VALID + Structure OK" : !tradingAllowed ? "Trading locked (commit + session guard)" : "Click to focus"
-        }
+        title={blocked ? "Blocked: needs VALID + Structure OK + fresh scalp bias" : !tradingAllowed ? "Trading locked (commit + session guard)" : "Click to focus"}
       >
         {(s.entryQuality !== "VALID" || s.structureLabel !== "OK") && (
           <div
@@ -3572,7 +3669,7 @@ export default function App() {
         )}
 
         <div style={{ fontWeight: 950, fontSize: "0.78rem", color: "#0b0b0c" }}>{s.symbol}</div>
-        <div style={{ fontSize: "0.72rem", marginTop: 2, color: "#0b0b0c", fontWeight: 900 }}>{Math.round(s.combinedScore)}</div>
+        <div style={{ fontSize: "0.72rem", marginTop: 2, color: "#0b0b0c", fontWeight: 900 }}>{Math.round(s.dayTradeScore)}</div>
       </div>
     );
   }
@@ -3831,10 +3928,11 @@ export default function App() {
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                     <div style={{ fontWeight: 950 }}>{s.symbol}</div>
-                    <ScorePill score={s.combinedScore} />
+                    <ScorePill score={s.dayTradeScore} />
                   </div>
                   <div style={{ ...subtle, marginTop: 8 }}>
-                    15m: {Math.round(s.score15m)} · 1h: {Math.round(s.score1h)} · Vol: {s.volFactor.toFixed(2)}x
+                    1h: {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h:{" "}
+                    {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · Vol: {s.volFactor.toFixed(2)}x
                   </div>
 
                   <EntryQualityBadge s={s} />
@@ -3980,7 +4078,7 @@ export default function App() {
             <div style={{ ...subtle, marginTop: 10, lineHeight: 1.6 }}>
               <b style={{ color: "#111827" }}>A+ only</b>
               <br />
-              VALID entry · Structure OK · Score ≥ 70 · Vol ≥ 1.3x · Clear 2R room
+              VALID entry · Structure OK · Fresh scalp bias · Day score ≥ 68 · Clear 2R room
               <br />
               <br />
               <b style={{ color: "#111827" }}>Risk stays small</b>
@@ -4090,7 +4188,7 @@ export default function App() {
                         {s.structureLabel}
                       </td>
                       <td style={{ padding: "10px 8px", textAlign: "right" }}>
-                        <ScorePill score={s.combinedScore} />
+                        <ScorePill score={s.dayTradeScore} />
                       </td>
                     </tr>
                   );
@@ -4112,7 +4210,7 @@ export default function App() {
           </div>
 
           <div style={{ ...subtle, marginTop: 8 }}>
-            Heatmap shows activity score. Entry Quality + Structure prevent chase-trading and “no 2R room”.
+            Heatmap shows day-trade score. Entry Quality + Structure + scalp bias prevent chase-trading and “no 2R room”.
           </div>
 
           <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: 10 }}>
@@ -4166,7 +4264,7 @@ export default function App() {
           <div>
             <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>BEST TO CONSIDER NOW (STRICT)</div>
             <div style={{ ...subtle, marginTop: 6 }}>
-              Filter: EntryQuality=VALID · Structure=OK · Combined ≥ 70 · 1h ≥ 65 · Vol ≥ 1.3x.
+              Filter: EntryQuality=VALID · Structure=OK · Fresh scalp bias · Day score ≥ 68 · Vol ≥ 1.15x.
             </div>
           </div>
           <button style={btn} onClick={refresh} disabled={isLoading}>
@@ -4200,11 +4298,12 @@ export default function App() {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                   <div style={{ fontWeight: 950 }}>{s.symbol}</div>
-                  <ScorePill score={s.combinedScore} />
+                  <ScorePill score={s.dayTradeScore} />
                 </div>
 
                 <div style={{ ...subtle, marginTop: 8 }}>
-                  1h: {Math.round(s.score1h)} · 15m: {Math.round(s.score15m)} · Vol: {s.volFactor.toFixed(2)}x
+                  Day score: {Math.round(s.dayTradeScore)} · 1h:{" "}
+                  {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · Vol: {s.volFactor.toFixed(2)}x
                 </div>
                 <div style={{ ...subtle, marginTop: 8 }}>
                   Room: <b style={{ color: "#111827" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
@@ -4250,7 +4349,8 @@ export default function App() {
                     {s.symbol} <span style={{ ...subtle }}>· {fmtUsd(s.priceUsd)} · {fmtPct(s.change24h)}</span>
                   </div>
                   <div style={{ ...subtle, marginTop: 6 }}>
-                    15m {Math.round(s.score15m)} · 1h {Math.round(s.score1h)} · Vol {s.volFactor.toFixed(2)}x · Entry{" "}
+                    Day {Math.round(s.dayTradeScore)} · 1h {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h{" "}
+                    {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · {s.scalpBias} · Entry{" "}
                     <b style={{ color: s.entryQuality === "VALID" ? "#047857" : s.entryQuality === "EXTENDED" ? "#111827" : "#b91c1c" }}>
                       {s.entryQuality}
                     </b>
@@ -4270,7 +4370,7 @@ export default function App() {
                 </div>
 
                 <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <ScorePill score={s.combinedScore} />
+                  <ScorePill score={s.dayTradeScore} />
                   <button
                     style={allowed ? btn : btnDisabled}
                     disabled={!allowed}
@@ -5015,15 +5115,15 @@ export default function App() {
         <div style={{ ...proPanel, marginTop: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             <div>
-              <div style={sectionTitle}>SHORT-TERM / LONG-TERM HOLDINGS</div>
+              <div style={sectionTitle}>DAY-TRADE HOLDINGS</div>
               <div style={{ ...subtle, marginTop: 6 }}>
                 {simState.positions.length
-                  ? `${simScalpPositions.length} scalp holding${simScalpPositions.length === 1 ? "" : "s"} · ${simLongStudyPositions.length} long-term study holding${simLongStudyPositions.length === 1 ? "" : "s"}.`
-                  : "Nothing bought yet. Short-term scalps stay separate from long-term study ideas."}
+                  ? `${simScalpPositions.length} scalp holding${simScalpPositions.length === 1 ? "" : "s"} · ${simLongStudyPositions.length} manual day-trade holding${simLongStudyPositions.length === 1 ? "" : "s"}.`
+                  : "Nothing bought yet. Main lane is awake-only scalping with stops and targets."}
               </div>
             </div>
             <span style={{ ...pill, color: simState.positions.length ? "#047857" : "#111827" }}>
-              Scalp {simScalpPositions.length} / Study {simLongStudyPositions.length}
+              Scalp {simScalpPositions.length} / Manual {simLongStudyPositions.length}
             </span>
           </div>
         </div>
@@ -5215,7 +5315,7 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button style={simTradeMode === "NORMAL" ? btnDanger : btn} onClick={() => setSimTradeMode("NORMAL")}>
-              Long-Term Study
+              Manual Day Trade
             </button>
             <button style={simTradeMode === "SCALP" ? btnDanger : btn} onClick={() => setSimTradeMode("SCALP")}>
               Short-Term Scalp
@@ -5317,11 +5417,11 @@ export default function App() {
             <div>
               <div style={sectionTitle}>BUY TICKET</div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                {simTradeMode === "SCALP" ? "Short-term scalp ticket: small size, fast exit, no late chases, no overnight holds." : "Long-term study ticket: research the idea separately from your scalp lane."}
+                {simTradeMode === "SCALP" ? "Short-term scalp ticket: small size, fast exit, no late chases, no overnight holds." : "Manual day-trade ticket: still awake-only, still needs a stop, target, and exit plan."}
               </div>
             </div>
             <span style={{ ...pill, color: simTradeMode === "SCALP" ? "#b91c1c" : "#047857" }}>
-              {simTradeMode === "SCALP" ? "SHORT-TERM SCALP" : "LONG-TERM STUDY"}
+              {simTradeMode === "SCALP" ? "SHORT-TERM SCALP" : "MANUAL DAY TRADE"}
             </span>
           </div>
 
@@ -5333,7 +5433,7 @@ export default function App() {
                   Price: <b style={{ color: "#111827" }}>{fmtUsd(simulatorPrice)}</b>
                 </div>
               </div>
-              <ScorePill score={simSelectedSetup?.combinedScore ?? 0} />
+              <ScorePill score={simSelectedSetup?.dayTradeScore ?? 0} />
             </div>
 
             <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
@@ -5621,7 +5721,7 @@ export default function App() {
                     ? "PEAK RISK"
                     : scalpSignal?.speedLabel === "FADING"
                       ? "FADING"
-                      : s.priceUsd && s.entryQuality === "VALID" && s.structureLabel === "OK" && s.combinedScore >= 70
+                      : s.priceUsd && s.entryQuality === "VALID" && s.structureLabel === "OK" && s.scalpBias === "WATCH"
                         ? "WATCH"
                         : s.priceUsd
                           ? "WAIT"
@@ -5648,10 +5748,14 @@ export default function App() {
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
                     <div style={{ fontWeight: 950 }}>{s.symbol}</div>
-                    <ScorePill score={s.combinedScore} />
+                    <ScorePill score={s.dayTradeScore} />
                   </div>
                   <div style={{ ...subtle, marginTop: 8 }}>
                     {fmtUsd(s.priceUsd)} · {fmtPct(s.change24h)}
+                  </div>
+                  <div style={{ ...subtle, marginTop: 4 }}>
+                    1h {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h{" "}
+                    {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · {s.pathLabel ?? "NO PATH"}
                   </div>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
                     <span style={{ ...pill, borderRadius: 7, color: s.entryQuality === "VALID" ? "#047857" : "#92400e" }}>{s.entryQuality}</span>
@@ -5752,7 +5856,7 @@ export default function App() {
                 <tbody>
                   {[
                     { label: "Short-term scalps", rows: simScalpPositions, note: "Awake-only trades. Close fast; do not let these turn into overnight holds." },
-                    { label: "Long-term study", rows: simLongStudyPositions, note: "Research lane only. Use this to learn, not as the default trading style." },
+                    { label: "Manual day trades", rows: simLongStudyPositions, note: "Awake-only manual lane. Close before sleep unless you deliberately choose to accept overnight risk." },
                   ].map((group) =>
                     group.rows.length ? (
                       <React.Fragment key={group.label}>
@@ -6007,7 +6111,7 @@ export default function App() {
             <div style={{ ...subtle, marginTop: 6 }}>{learningReview.all.winRate.toFixed(0)}% win rate</div>
           </div>
           <div style={statCard}>
-            <div style={subtle}>Long-term study</div>
+            <div style={subtle}>Manual day trade</div>
             <div style={{ fontWeight: 950, color: learningReview.normal.expectancyPct >= 0 ? "#047857" : "#b91c1c" }}>
               {learningReview.normal.count ? `${learningReview.normal.expectancyPct >= 0 ? "+" : ""}${learningReview.normal.expectancyPct.toFixed(2)}%` : "No data"}
             </div>
