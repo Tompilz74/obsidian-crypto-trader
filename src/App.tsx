@@ -744,6 +744,7 @@ const LS_ALERT_SETTINGS = "ob:alert-settings";
 const REVOLUT_X_TAKER_FEE_PCT = 0.09;
 const REVOLUT_X_ROUND_TRIP_FEE_PCT = REVOLUT_X_TAKER_FEE_PCT * 2;
 const DEFAULT_REVOLUT_X_ENTRY_SLIPPAGE_PCT = 0.3;
+const PRIORITY_SCALP_SYMBOLS = new Set(["SYND"]);
 const CHECKOUT_URL =
   (import.meta.env.VITE_CHECKOUT_URL as string | undefined) ||
   "mailto:you@example.com?subject=Obsidian%20Pro%20access&body=I%20want%20Obsidian%20Crypto%20Trader%20Pro.";
@@ -1620,7 +1621,8 @@ export default function App() {
           const s = scoreSetup(m, baselineVolTemp);
           const ch = m.change24h ?? 0;
           const active = Math.abs(ch) >= 0.8 && (m.volume24hUsd ?? 0) > 0;
-          const priority = s.combinedScore + Math.max(0, ch) * 0.8 + (active ? 8 : -18);
+          const priorityBoost = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase()) ? 80 : 0;
+          const priority = s.combinedScore + Math.max(0, ch) * 0.8 + (active ? 8 : -18) + priorityBoost;
           return { symbol: m.symbol, cgId: m.cgId, combined: priority };
         })
         .filter((x) => !!x.cgId)
@@ -1636,7 +1638,8 @@ export default function App() {
           const positiveTape = clamp(Math.max(0, ch), 0, 18);
           const notTooVertical = ch <= 28 ? 8 : -10;
           const earlyTape = ch > -1 ? 8 : -8;
-          const scalpPriority = positiveTape * 5.8 + Math.log10(Math.max(1, volFactor)) * 38 + earlyTape + activeTape + notTooVertical;
+          const priorityBoost = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase()) ? 80 : 0;
+          const scalpPriority = positiveTape * 5.8 + Math.log10(Math.max(1, volFactor)) * 38 + earlyTape + activeTape + notTooVertical + priorityBoost;
           return { symbol: m.symbol, cgId: m.cgId, scalpPriority };
         })
         .filter((x) => !!x.cgId && x.scalpPriority > 5)
@@ -1857,7 +1860,8 @@ export default function App() {
           const change = Math.abs(m.change24h ?? 0);
           const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
           const hasVolume = (m.volume24hUsd ?? 0) > 0;
-          return hasLivePrice && hasVolume && change >= 0.8;
+          const priority = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase());
+          return hasLivePrice && hasVolume && (change >= 0.8 || priority);
         }).length
       : marketUniverse.length;
     return { total: allCoins.length, active, live, missing, custom: customRevolutCoins.length };
@@ -1875,7 +1879,8 @@ export default function App() {
       const change = Math.abs(m.change24h ?? 0);
       const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
       const hasVolume = (m.volume24hUsd ?? 0) > 0;
-      return hasLivePrice && hasVolume && change >= 0.8;
+      const priority = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase());
+      return hasLivePrice && hasVolume && (change >= 0.8 || priority);
     });
   }, [hideFlatCoins, marketUniverse, query]);
 
@@ -5769,6 +5774,9 @@ export default function App() {
                     >
                       {coinVerdict}
                     </span>
+                    {PRIORITY_SCALP_SYMBOLS.has(s.symbol.toUpperCase()) && (
+                      <span style={{ ...pill, borderRadius: 7, color: "#0f766e" }}>PRIORITY</span>
+                    )}
                   </div>
                   {scalpSignal && (
                     <div style={{ ...subtle, marginTop: 8 }}>
