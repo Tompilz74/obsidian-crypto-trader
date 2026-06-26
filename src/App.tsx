@@ -24,16 +24,18 @@ type SessionStatus = "TRADE" | "SELECTIVE" | "WAIT";
 type TradeSide = "LONG" | "SHORT";
 type SimTradeMode = "NORMAL" | "SCALP";
 
-const MARKET_REFRESH_MS = 90 * 1000;
-const MARKET_REFRESH_LABEL = "90s";
+const MARKET_REFRESH_MS = 30 * 1000;
+const MARKET_REFRESH_LABEL = "30s";
 
 type MarketRow = {
   symbol: string;
   cgId?: string;
   name?: string;
   priceUsd?: number;
+  change1h?: number;
   change24h?: number;
   volume24hUsd?: number;
+  sparkline?: number[];
 };
 
 type SetupRow = {
@@ -43,6 +45,7 @@ type SetupRow = {
   score15m: number;
   score1h: number;
   volFactor: number;
+  change1h?: number;
   change24h?: number;
   priceUsd?: number;
   why: string[];
@@ -289,6 +292,7 @@ type PathMomentum = {
 };
 
 type AlertSettings = {
+  version: number;
   enabled: boolean;
   telegramEnabled: boolean;
   minFastMovePct: number;
@@ -330,6 +334,10 @@ const fmtUsd = (n?: number) =>
       : `$${n.toLocaleString(undefined, { maximumFractionDigits: 8 })}`
     : "—";
 const fmtPct = (n?: number) => (typeof n === "number" && isFinite(n) ? `${n.toFixed(2)}%` : "—");
+const fmtOneHour = (s: Pick<SetupRow, "ret1h" | "change1h">) => {
+  const value = typeof s.ret1h === "number" ? s.ret1h : s.change1h;
+  return typeof value === "number" && isFinite(value) ? `${value >= 0 ? "+" : ""}${value.toFixed(2)}%` : "loading";
+};
 const fmtR = (r?: number) =>
   typeof r === "number" && isFinite(r) ? `${r >= 0 ? "+" : ""}${r.toFixed(2)}R` : "—";
 const confidencePct = (n?: number) => {
@@ -576,8 +584,11 @@ async function fetchCoinGeckoMarkets(ids: string[]) {
     symbol: string;
     name: string;
     current_price: number;
+    price_change_percentage_1h_in_currency: number | null;
     price_change_percentage_24h: number | null;
+    price_change_percentage_24h_in_currency: number | null;
     total_volume: number | null;
+    sparkline_in_7d?: { price?: number[] };
   }>;
 }
 
@@ -645,10 +656,11 @@ function computeMicro(prices: number[]): MicroMetrics {
 /** Proxy scoring until deeper candle logic (Phase 2C+) */
 function scoreSetup(row: MarketRow, baselineVol: number) {
   const ch = row.change24h ?? 0;
+  const ch1h = row.change1h ?? 0;
   const vol = row.volume24hUsd ?? 0;
   const volFactor = baselineVol > 0 ? vol / baselineVol : 1;
 
-  const changeScore = clamp(50 + ch * 4, 0, 100);
+  const changeScore = clamp(50 + ch * 2.4 + ch1h * 12, 0, 100);
   const volScore = clamp(50 + Math.log10(Math.max(1, volFactor)) * 25, 0, 100);
 
   const score15m = clamp(changeScore * 0.55 + volScore * 0.45 + 4, 0, 100);
@@ -659,6 +671,7 @@ function scoreSetup(row: MarketRow, baselineVol: number) {
   if (combined >= 80) why.push("High participation + strong tape");
   if (combined >= 65 && combined < 80) why.push("Tradable activity");
   if (volFactor >= 1.3) why.push("Volume elevated vs baseline");
+  if (ch1h >= 0.5) why.push(`Fresh 1h push +${ch1h.toFixed(2)}%`);
   if (ch >= 3) why.push("Positive 24h trend");
   if (ch < 0) why.push("24h negative — be selective");
 
@@ -667,7 +680,7 @@ function scoreSetup(row: MarketRow, baselineVol: number) {
 
 function scoreDayTradeSetup(row: MarketRow, base: ReturnType<typeof scoreSetup>, micro?: MicroMetrics, path?: PathMomentum) {
   const ch = row.change24h ?? 0;
-  const ret1h = micro?.ret1h ?? path?.path1h ?? ch * 0.08;
+  const ret1h = micro?.ret1h ?? row.change1h ?? path?.path1h ?? ch * 0.08;
   const ret4h = micro?.ret4h ?? path?.path4h ?? ch * 0.22;
   const drop = micro?.dropFromHigh6h ?? path?.pullbackPct ?? 0;
   const spike = micro?.spikeFromLow6h ?? Math.max(0, ret4h);
@@ -759,11 +772,12 @@ const COMMIT_SESSION_OPTIONS: Array<[CommitSessionKey, string]> = [
 
 function defaultAlertSettings(): AlertSettings {
   return {
+    version: 2,
     enabled: true,
     telegramEnabled: true,
-    minFastMovePct: 2.5,
-    minBuildMovePct: 5,
-    minBurstScore: 72,
+    minFastMovePct: 0.8,
+    minBuildMovePct: 2.5,
+    minBurstScore: 64,
     requireLegs: true,
     peakRiskAlerts: true,
   };
@@ -772,6 +786,7 @@ function defaultAlertSettings(): AlertSettings {
 function loadAlertSettings(): AlertSettings {
   try {
     const parsed = JSON.parse(localStorage.getItem(LS_ALERT_SETTINGS) || "null") as Partial<AlertSettings> | null;
+    if (parsed?.version !== defaultAlertSettings().version) return defaultAlertSettings();
     return { ...defaultAlertSettings(), ...(parsed ?? {}) };
   } catch {
     return defaultAlertSettings();
@@ -1593,13 +1608,27 @@ export default function App() {
           cgId: c.cgId,
           name: c.name ?? r?.name,
           priceUsd: r?.current_price,
-          change24h: typeof r?.price_change_percentage_24h === "number" ? r!.price_change_percentage_24h : undefined,
+          change1h: typeof r?.price_change_percentage_1h_in_currency === "number" ? r!.price_change_percentage_1h_in_currency : undefined,
+          change24h:
+            typeof r?.price_change_percentage_24h_in_currency === "number"
+              ? r!.price_change_percentage_24h_in_currency
+              : typeof r?.price_change_percentage_24h === "number"
+                ? r!.price_change_percentage_24h
+                : undefined,
           volume24hUsd: typeof r?.total_volume === "number" ? r!.total_volume : undefined,
+          sparkline: r?.sparkline_in_7d?.price?.filter((x) => typeof x === "number" && isFinite(x) && x > 0),
         };
       });
 
       setMarket(merged);
       setLastUpdated(Date.now());
+      setPriceHistoryMap((prev) => {
+        const next = { ...prev };
+        for (const row of merged) {
+          if (row.sparkline && row.sparkline.length >= 2) next[row.symbol] = row.sparkline;
+        }
+        return next;
+      });
 
       // Autofill entry/stop if not set yet
       const picked = merged.find((m) => m.symbol === focusSymbol);
@@ -1620,26 +1649,29 @@ export default function App() {
         .map((m) => {
           const s = scoreSetup(m, baselineVolTemp);
           const ch = m.change24h ?? 0;
-          const active = Math.abs(ch) >= 0.8 && (m.volume24hUsd ?? 0) > 0;
+          const ch1h = m.change1h ?? 0;
+          const active = (Math.abs(ch) >= 0.8 || Math.abs(ch1h) >= 0.25) && (m.volume24hUsd ?? 0) > 0;
           const priorityBoost = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase()) ? 80 : 0;
-          const priority = s.combinedScore + Math.max(0, ch) * 0.8 + (active ? 8 : -18) + priorityBoost;
+          const priority = s.combinedScore + Math.max(0, ch) * 0.45 + Math.max(0, ch1h) * 18 + (active ? 8 : -18) + priorityBoost;
           return { symbol: m.symbol, cgId: m.cgId, combined: priority };
         })
         .filter((x) => !!x.cgId)
         .sort((a, b) => b.combined - a.combined)
-        .slice(0, 18);
+        .slice(0, 12);
 
       const scalpRankedTemp = merged
         .map((m) => {
           const vol = m.volume24hUsd ?? 0;
           const volFactor = baselineVolTemp > 0 ? vol / baselineVolTemp : 1;
           const ch = m.change24h ?? 0;
-          const activeTape = Math.abs(ch) >= 0.8 ? 10 : -10;
+          const ch1h = m.change1h ?? 0;
+          const activeTape = Math.abs(ch) >= 0.8 || Math.abs(ch1h) >= 0.25 ? 10 : -10;
           const positiveTape = clamp(Math.max(0, ch), 0, 18);
+          const freshTape = clamp(Math.max(0, ch1h), 0, 5);
           const notTooVertical = ch <= 28 ? 8 : -10;
           const earlyTape = ch > -1 ? 8 : -8;
           const priorityBoost = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase()) ? 80 : 0;
-          const scalpPriority = positiveTape * 5.8 + Math.log10(Math.max(1, volFactor)) * 38 + earlyTape + activeTape + notTooVertical + priorityBoost;
+          const scalpPriority = freshTape * 34 + positiveTape * 3.8 + Math.log10(Math.max(1, volFactor)) * 38 + earlyTape + activeTape + notTooVertical + priorityBoost;
           return { symbol: m.symbol, cgId: m.cgId, scalpPriority };
         })
         .filter((x) => !!x.cgId && x.scalpPriority > 5)
@@ -1668,7 +1700,7 @@ export default function App() {
 
       // ---- Quick scalp micro refresh: prioritize fresh 1h/4h acceleration for fast movers
       try {
-        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 42);
+        const scalpTargets = scalpRankedTemp.filter((x) => !rankedTemp.some((r) => r.symbol === x.symbol)).slice(0, 18);
         const scalpPairs = await Promise.all(
           scalpTargets.map(async (x) => {
             const prices = await fetchCoinGeckoHourly24h(x.cgId!);
@@ -1858,10 +1890,11 @@ export default function App() {
     const active = hideFlatCoins
       ? marketUniverse.filter((m) => {
           const change = Math.abs(m.change24h ?? 0);
+          const freshChange = Math.abs(m.change1h ?? 0);
           const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
           const hasVolume = (m.volume24hUsd ?? 0) > 0;
           const priority = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase());
-          return hasLivePrice && hasVolume && (change >= 0.8 || priority);
+          return hasLivePrice && hasVolume && (change >= 0.8 || freshChange >= 0.25 || priority);
         }).length
       : marketUniverse.length;
     return { total: allCoins.length, active, live, missing, custom: customRevolutCoins.length };
@@ -1877,10 +1910,11 @@ export default function App() {
     if (q || !hideFlatCoins) return searched;
     return searched.filter((m) => {
       const change = Math.abs(m.change24h ?? 0);
+      const freshChange = Math.abs(m.change1h ?? 0);
       const hasLivePrice = typeof m.priceUsd === "number" && isFinite(m.priceUsd);
       const hasVolume = (m.volume24hUsd ?? 0) > 0;
       const priority = PRIORITY_SCALP_SYMBOLS.has(m.symbol.toUpperCase());
-      return hasLivePrice && hasVolume && (change >= 0.8 || priority);
+      return hasLivePrice && hasVolume && (change >= 0.8 || freshChange >= 0.25 || priority);
     });
   }, [hideFlatCoins, marketUniverse, query]);
 
@@ -1905,6 +1939,7 @@ export default function App() {
         return {
           symbol: m.symbol,
           priceUsd: m.priceUsd,
+          change1h: m.change1h,
           change24h: m.change24h,
           combinedScore: s.combinedScore,
           dayTradeScore: dayTrade.dayTradeScore,
@@ -2040,15 +2075,18 @@ export default function App() {
       .map((s) => {
         const price = getSimPrice(s.symbol) || s.priceUsd || 0;
         const ch24 = s.change24h ?? 0;
+        const fresh1h = typeof s.change1h === "number" ? s.change1h : undefined;
         const hasMicro = typeof s.ret1h === "number" && typeof s.ret4h === "number";
-        const fastMove = typeof s.ret1h === "number" ? s.ret1h : ch24 * 0.16;
+        const hasFreshTape = typeof fresh1h === "number";
+        const fastMove = typeof s.ret1h === "number" ? s.ret1h : hasFreshTape ? fresh1h : ch24 * 0.16;
         const move4h = typeof s.ret4h === "number" ? s.ret4h : ch24 * 0.38;
         const path = computePathMomentum(priceHistoryMap[s.symbol] ?? []);
         const pathAware = path.stairScore > 0;
-        const activeEnough = Math.abs(ch24) >= 0.8 || path.stairScore >= 55 || Math.abs(fastMove) >= 0.12 || Math.abs(move4h) >= 0.8;
+        const activeEnough = Math.abs(ch24) >= 0.8 || path.stairScore >= 55 || Math.abs(fastMove) >= 0.08 || Math.abs(move4h) >= 0.8;
         const stairLaunch = path.stairScore >= 70 && path.slopeLift > 0.08 && path.path4h >= 1.4 && path.pullbackPct > -2.4;
         const pathBreakout = path.path1h >= 1.25 && path.path4h >= 2.2 && path.slopeLift > 0.18 && path.verticalRisk < 72;
         const pathStillHasLegs = stairLaunch && path.verticalRisk < 62 && path.greenRatio >= 0.52;
+        const freshLift = hasFreshTape && fastMove >= 0.28 && path.path4h >= -0.4 && path.verticalRisk < 72;
         const acceleration = fastMove - move4h / 4;
         const volumeScore = clamp(Math.log10(Math.max(1, s.volFactor)) * 36 + 42, 0, 100);
         const momentumScore = clamp(
@@ -2067,7 +2105,7 @@ export default function App() {
         const latestWeak = hasMicro && fastMove <= 0;
         const stalling = hasMicro && fastMove < 0.18 && acceleration <= 0.28;
         const rollingOver = latestWeak || (dropFromHigh <= -1.2 && acceleration <= 0.28 && !pathStillHasLegs) || (spike6h >= 5 && stalling && !stairLaunch);
-        const continuationOk = (hasMicro && fastMove > 0.18 && acceleration > 0.05 && dropFromHigh > -1.8) || pathBreakout || pathStillHasLegs;
+        const continuationOk = (hasMicro && fastMove > 0.18 && acceleration > 0.05 && dropFromHigh > -1.8) || freshLift || pathBreakout || pathStillHasLegs;
         const peakRiskScore = Math.round(clamp(
           spike6h * 6 +
             Math.max(0, ch24 - 12) * 3 +
@@ -2097,10 +2135,10 @@ export default function App() {
         const peakRisk = peakRiskScore >= 62 || (spike6h >= 8 && acceleration <= 0.15 && !pathStillHasLegs) || path.verticalRisk >= 78;
         const tooLate = peakRisk || rollingOver || ((s.spikeFromLow6h ?? 0) >= 13 && !pathStillHasLegs) || (fastMove >= 4.2 && acceleration <= 0) || (ch24 >= 34 && path.verticalRisk >= 62);
         const dumpRisk = (s.dropFromHigh6h ?? 0) <= -3.2 || fastMove <= -1.4 || ch24 <= -5;
-        const earlyBurst = !rollingOver && legsScore >= 55 && ((hasMicro && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 9) || pathBreakout);
+        const earlyBurst = !rollingOver && legsScore >= 55 && ((hasMicro && fastMove >= 0.35 && acceleration > 0.08 && spike6h < 9) || freshLift || pathBreakout);
         const warming = !rollingOver && ((hasMicro && fastMove >= 0.1 && acceleration > 0 && move4h > 0) || stairLaunch);
         const structurePenalty = s.structureLabel === "NO_EDGE" ? 18 : s.structureLabel === "WAIT" ? 8 : 0;
-        const freshnessBonus = hasMicro ? 10 : -8;
+        const freshnessBonus = hasMicro ? 10 : hasFreshTape ? 4 : -8;
         const pathBonus = pathAware ? (path.label === "LIFTING" ? 16 : path.label === "BUILDING" ? 9 : path.label === "VERTICAL" ? -10 : 0) : 0;
         const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + pathBonus + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
@@ -2109,7 +2147,7 @@ export default function App() {
         const targetPct = clamp(Math.max(rawTargetPct, minNetTargetPct), minNetTargetPct, 4.8);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
-        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 55 && continuationOk && (earlyBurst || fastMove > 0.25) ? "SCALP_TEST" : burstScore >= 54 || warming ? "WATCH" : "NO_LIQUIDITY";
+        const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 64 && legsScore >= 55 && continuationOk && (earlyBurst || fastMove > 0.22) ? "SCALP_TEST" : burstScore >= 50 || warming || freshLift ? "WATCH" : "NO_LIQUIDITY";
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
         const speedLabel = hasMicro ? (rollingOver ? "FADING" : earlyBurst ? "EARLY BURST" : continuationOk ? "ACCELERATING" : "WATCHING") : "NEEDS MICRO";
         const legsLabel = peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 70 && continuationOk ? "HAS LEGS" : legsScore >= 50 && !rollingOver ? "MAYBE LEGS" : "NO LEGS";
@@ -2117,14 +2155,15 @@ export default function App() {
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
           `Burst score ${burstScore}/100`,
-          hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
+          hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : hasFreshTape ? `CG 1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
           `Accel ${acceleration >= 0 ? "+" : ""}${acceleration.toFixed(2)}`,
           pathAware ? `Path ${path.label} ${path.stairScore}/100` : "Path loading",
           `Legs ${legsScore}/100`,
           `Volume ${s.volFactor.toFixed(2)}x baseline`,
         ];
         const warnings: string[] = [];
-        if (!hasMicro) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
+        if (!hasMicro && hasFreshTape) warnings.push("Using CoinGecko 1h tape until deeper chart data refreshes.");
+        if (!hasMicro && !hasFreshTape) warnings.push("Waiting for fresh hourly micro data; advice may lag.");
         if (path.label === "VERTICAL") warnings.push("Chart has gone vertical; do not chase without pullback/reclaim.");
         if (stairLaunch && !tooLate) warnings.push("Stair-step momentum detected; watch for a controlled entry before the next vertical push.");
         if (latestWeak) warnings.push("Latest 1h is red; wait for reclaim before entering.");
@@ -2153,11 +2192,11 @@ export default function App() {
 
     for (const signal of scalpSignals.slice(0, 12)) {
       const history = priceHistoryMap[signal.symbol] ?? [];
-      const fastPct = recentPathPct(history, 6);
+      const freshPct = typeof signal.setup.change1h === "number" ? signal.setup.change1h : recentPathPct(history, 1);
       const buildPct = recentPathPct(history, 24);
       const legsOk = !alertSettings.requireLegs || signal.legsLabel === "HAS LEGS" || signal.legsLabel === "MAYBE LEGS";
 
-      if (fastPct >= alertSettings.minFastMovePct && legsOk && signal.peakRiskScore < 58) {
+      if (freshPct >= alertSettings.minFastMovePct && legsOk && signal.peakRiskScore < 58) {
         const id = `${signal.symbol}:FAST_SPIKE`;
         seen.add(id);
         alerts.push({
@@ -2165,9 +2204,9 @@ export default function App() {
           symbol: signal.symbol,
           kind: "FAST_SPIKE",
           title: `${signal.symbol} fast spike`,
-          detail: `${fastPct.toFixed(2)}% jump over recent chart ticks. Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}.`,
+          detail: `${freshPct.toFixed(2)}% fresh 1h move. Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}.`,
           tone: "#047857",
-          score: Math.round(signal.burstScore + fastPct * 4),
+          score: Math.round(signal.burstScore + freshPct * 6),
         });
       }
 
@@ -2274,6 +2313,7 @@ export default function App() {
     const base: SetupRow[] = setups.length ? setups : allCoins.map((c) => ({
       symbol: c.symbol,
       priceUsd: undefined,
+      change1h: undefined,
       change24h: undefined,
       combinedScore: 0,
       dayTradeScore: 0,
@@ -3936,7 +3976,7 @@ export default function App() {
                     <ScorePill score={s.dayTradeScore} />
                   </div>
                   <div style={{ ...subtle, marginTop: 8 }}>
-                    1h: {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h:{" "}
+                    1h: {fmtOneHour(s)} · 4h:{" "}
                     {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · Vol: {s.volFactor.toFixed(2)}x
                   </div>
 
@@ -4308,7 +4348,7 @@ export default function App() {
 
                 <div style={{ ...subtle, marginTop: 8 }}>
                   Day score: {Math.round(s.dayTradeScore)} · 1h:{" "}
-                  {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · Vol: {s.volFactor.toFixed(2)}x
+                  {fmtOneHour(s)} · Vol: {s.volFactor.toFixed(2)}x
                 </div>
                 <div style={{ ...subtle, marginTop: 8 }}>
                   Room: <b style={{ color: "#111827" }}>{(s.roomTo2R ?? 0).toFixed(2)}R</b>
@@ -4354,7 +4394,7 @@ export default function App() {
                     {s.symbol} <span style={{ ...subtle }}>· {fmtUsd(s.priceUsd)} · {fmtPct(s.change24h)}</span>
                   </div>
                   <div style={{ ...subtle, marginTop: 6 }}>
-                    Day {Math.round(s.dayTradeScore)} · 1h {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h{" "}
+                    Day {Math.round(s.dayTradeScore)} · 1h {fmtOneHour(s)} · 4h{" "}
                     {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · {s.scalpBias} · Entry{" "}
                     <b style={{ color: s.entryQuality === "VALID" ? "#047857" : s.entryQuality === "EXTENDED" ? "#111827" : "#b91c1c" }}>
                       {s.entryQuality}
@@ -5759,7 +5799,7 @@ export default function App() {
                     {fmtUsd(s.priceUsd)} · {fmtPct(s.change24h)}
                   </div>
                   <div style={{ ...subtle, marginTop: 4 }}>
-                    1h {s.ret1h === undefined ? "loading" : `${s.ret1h >= 0 ? "+" : ""}${s.ret1h.toFixed(2)}%`} · 4h{" "}
+                    1h {fmtOneHour(s)} · 4h{" "}
                     {s.ret4h === undefined ? "loading" : `${s.ret4h >= 0 ? "+" : ""}${s.ret4h.toFixed(2)}%`} · {s.pathLabel ?? "NO PATH"}
                   </div>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
