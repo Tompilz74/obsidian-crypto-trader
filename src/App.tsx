@@ -898,6 +898,34 @@ function normalizeCoinDef(coin: Partial<CoinDef>): CoinDef | null {
   return { symbol, cgId, name: name || symbol };
 }
 
+function parseCoinDefsFromText(text: string): CoinDef[] {
+  const coins: CoinDef[] = [];
+  const seen = new Set<string>();
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const coinUrlMatch = line.match(/coingecko\.com\/en\/coins\/([^/?#\s]+)/i);
+    const cleaned = line
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/[|;]/g, ",")
+      .trim();
+    const commaParts = cleaned.includes(",") ? cleaned.split(",").map((p) => p.trim()).filter(Boolean) : [];
+    const parts = commaParts.length ? commaParts : cleaned.split(/\s+/).filter(Boolean);
+
+    const symbol = (parts[0] ?? "").replace(/[^a-z0-9]/gi, "").toUpperCase();
+    const cgId = (coinUrlMatch?.[1] ?? parts[1] ?? "").replace(/[^a-z0-9-]/gi, "").toLowerCase();
+    const name = (commaParts.length ? parts.slice(2).join(" ") : parts.slice(2).join(" ")) || symbol;
+    const coin = normalizeCoinDef({ symbol, cgId, name });
+    if (!coin || seen.has(coin.symbol)) continue;
+    seen.add(coin.symbol);
+    coins.push(coin);
+  }
+
+  return coins;
+}
+
 function loadCustomRevolutCoins(): CoinDef[] {
   try {
     const parsed = JSON.parse(localStorage.getItem(LS_CUSTOM_REVOLUT_COINS) || "[]") as Partial<CoinDef>[];
@@ -1536,6 +1564,8 @@ export default function App() {
   const [customCoinSymbol, setCustomCoinSymbol] = useState("");
   const [customCoinCgId, setCustomCoinCgId] = useState("");
   const [customCoinName, setCustomCoinName] = useState("");
+  const [bulkCoinText, setBulkCoinText] = useState("");
+  const [universeImportStatus, setUniverseImportStatus] = useState("");
   const [simBuyUsd, setSimBuyUsd] = useState("250");
   const [simStopLossInput, setSimStopLossInput] = useState("");
   const [simTakeProfitInput, setSimTakeProfitInput] = useState("");
@@ -1899,6 +1929,17 @@ export default function App() {
       : marketUniverse.length;
     return { total: allCoins.length, active, live, missing, custom: customRevolutCoins.length };
   }, [allCoins.length, customRevolutCoins.length, hideFlatCoins, marketUniverse]);
+
+  const universeAudit = useMemo(() => {
+    const noCgId = allCoins.filter((coin) => !coin.cgId).map((coin) => coin.symbol).sort();
+    const noLive = marketUniverse
+      .filter((m) => m.cgId && !(typeof m.priceUsd === "number" && isFinite(m.priceUsd)))
+      .map((m) => m.symbol)
+      .sort();
+    const freshMoving = marketUniverse.filter((m) => Math.abs(m.change1h ?? 0) >= 0.25).length;
+    const moving24h = marketUniverse.filter((m) => Math.abs(m.change24h ?? 0) >= 0.8).length;
+    return { noCgId, noLive, freshMoving, moving24h };
+  }, [allCoins, marketUniverse]);
 
   const filteredMarket = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -3338,12 +3379,41 @@ export default function App() {
     setSimCoinSearch(coin.symbol);
   };
 
+  const importCustomRevolutCoins = () => {
+    const parsed = parseCoinDefsFromText(bulkCoinText);
+    if (!parsed.length) {
+      setUniverseImportStatus("Paste one coin per line: SYMBOL, coingecko-id, optional name.");
+      return;
+    }
+
+    const existing = new Set(allCoins.map((coin) => coin.symbol.toUpperCase()));
+    const next: CoinDef[] = [];
+    for (const coin of parsed) {
+      if (existing.has(coin.symbol)) continue;
+      existing.add(coin.symbol);
+      next.push(coin);
+    }
+
+    if (!next.length) {
+      setUniverseImportStatus(`Parsed ${parsed.length}, but all were already tracked.`);
+      return;
+    }
+
+    setCustomRevolutCoins((coins) => [...coins, ...next].sort((a, b) => a.symbol.localeCompare(b.symbol)));
+    setUniverseImportStatus(`Added ${next.length} new coins. Skipped ${parsed.length - next.length} already tracked.`);
+    setBulkCoinText("");
+    setQuery(next[0].symbol);
+    setSimCoinSearch(next[0].symbol);
+  };
+
   const removeCustomRevolutCoin = (symbol: string) => {
     setCustomRevolutCoins((coins) => coins.filter((coin) => coin.symbol.toUpperCase() !== symbol.toUpperCase()));
   };
 
   const resetCoinUniverse = () => {
     setCustomRevolutCoins([]);
+    setBulkCoinText("");
+    setUniverseImportStatus("Custom universe cleared. Built-in Revolut X working list is active.");
     setHideFlatCoins(true);
     setQuery("");
     setSimCoinSearch("");
@@ -4173,6 +4243,29 @@ export default function App() {
             <button style={btn} onClick={resetCoinUniverse}>
               Reset Coin Universe
             </button>
+          </div>
+
+          <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontWeight: 950, color: "#111827" }}>Revolut universe audit</div>
+                <div style={{ ...subtle, marginTop: 5 }}>
+                  Live {universeStats.live}/{universeStats.total} · no live data {universeAudit.noLive.length} · fresh movers {universeAudit.freshMoving} · 24h movers {universeAudit.moving24h}
+                </div>
+              </div>
+              <button style={btn} onClick={() => setHideFlatCoins(false)}>Show all tracked</button>
+            </div>
+            {universeAudit.noLive.length > 0 && (
+              <div style={{ ...subtle, marginTop: 8 }}>
+                No live price right now: {universeAudit.noLive.slice(0, 18).join(", ")}
+                {universeAudit.noLive.length > 18 ? ` +${universeAudit.noLive.length - 18} more` : ""}
+              </div>
+            )}
+            {universeAudit.noCgId.length > 0 && (
+              <div style={{ ...subtle, marginTop: 6, color: "#b91c1c" }}>
+                Missing CoinGecko IDs: {universeAudit.noCgId.join(", ")}
+              </div>
+            )}
           </div>
 
           <div style={{ marginTop: 10, overflow: "auto", maxHeight: 420 }}>
@@ -5746,6 +5839,16 @@ export default function App() {
                 placeholder="Name optional"
               />
               <button style={btn} onClick={addCustomRevolutCoin}>Add</button>
+            </div>
+            <textarea
+              style={{ ...input, minHeight: 92, marginTop: 10, resize: "vertical" }}
+              value={bulkCoinText}
+              onChange={(e) => setBulkCoinText(e.target.value)}
+              placeholder={"Bulk add one per line:\nSYND, syndicate, Syndicate\nSYN https://www.coingecko.com/en/coins/synapse-2"}
+            />
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+              <button style={btn} onClick={importCustomRevolutCoins}>Import list</button>
+              {universeImportStatus && <span style={subtle}>{universeImportStatus}</span>}
             </div>
             {customRevolutCoins.length > 0 && (
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
