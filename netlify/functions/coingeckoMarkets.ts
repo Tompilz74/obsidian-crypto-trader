@@ -18,7 +18,7 @@ export const handler: Handler = async (event) => {
         per_page: "250",
         page: "1",
         sparkline: "true",
-        price_change_percentage: "1h,24h",
+        price_change_percentage: "1h,24h,7d",
       }).toString();
 
     const res = await fetch(url, { headers: { "User-Agent": "obsidian-terminal/1.0" } });

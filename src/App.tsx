@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getRevolutXUniverseAssets } from "./config/revolutXUniverse";
 
 /**
  * OBSIDIAN CRYPTO TRADER — Phase 2A + 2B + 3 (Structure Engine)
@@ -34,8 +35,11 @@ type MarketRow = {
   priceUsd?: number;
   change1h?: number;
   change24h?: number;
+  change7d?: number;
   volume24hUsd?: number;
+  marketCapUsd?: number;
   sparkline?: number[];
+  unavailableReason?: string;
 };
 
 type SetupRow = {
@@ -47,7 +51,9 @@ type SetupRow = {
   volFactor: number;
   change1h?: number;
   change24h?: number;
+  change7d?: number;
   priceUsd?: number;
+  marketCapUsd?: number;
   why: string[];
 
   // Phase 2B: entry quality layer (separate from activity)
@@ -587,7 +593,9 @@ async function fetchCoinGeckoMarkets(ids: string[]) {
     price_change_percentage_1h_in_currency: number | null;
     price_change_percentage_24h: number | null;
     price_change_percentage_24h_in_currency: number | null;
+    price_change_percentage_7d_in_currency: number | null;
     total_volume: number | null;
+    market_cap: number | null;
     sparkline_in_7d?: { price?: number[] };
   }>;
 }
@@ -595,8 +603,17 @@ async function fetchCoinGeckoMarkets(ids: string[]) {
 async function fetchCoinGeckoMarketsBatched(ids: string[], batchSize = 75) {
   const batches: string[][] = [];
   for (let i = 0; i < ids.length; i += batchSize) batches.push(ids.slice(i, i + batchSize));
-  const results = await Promise.all(batches.map((batch) => fetchCoinGeckoMarkets(batch)));
-  return results.flat();
+  const settled = await Promise.allSettled(batches.map((batch) => fetchCoinGeckoMarkets(batch)));
+  const results: Awaited<ReturnType<typeof fetchCoinGeckoMarkets>> = [];
+  const failedIds: string[] = [];
+  settled.forEach((result, index) => {
+    if (result.status === "fulfilled") {
+      results.push(...result.value);
+    } else {
+      failedIds.push(...batches[index]);
+    }
+  });
+  return { rows: results, failedIds };
 }
 
 /** Phase 2B: Hourly chart (24h) — via Netlify function proxy */
@@ -1613,14 +1630,17 @@ export default function App() {
   const localTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const sessionInfo = computeSession(new Date());
 
-  const allCoins = useMemo(() => {
-    const bySymbol = new Map<string, CoinDef>();
-    for (const coin of [...COINS, ...customRevolutCoins]) {
-      const normalized = normalizeCoinDef(coin);
-      if (normalized) bySymbol.set(normalized.symbol, normalized);
-    }
-    return [...bySymbol.values()];
-  }, [customRevolutCoins]);
+  const revolutXUniverse = useMemo(() => getRevolutXUniverseAssets(), []);
+
+  const allCoins = useMemo<CoinDef[]>(
+    () =>
+      revolutXUniverse.assets.map((asset) => ({
+        symbol: asset.symbol,
+        cgId: asset.cgId,
+        name: asset.name ?? asset.symbol,
+      })),
+    [revolutXUniverse]
+  );
 
   const coinIds = useMemo(() => allCoins.map((c) => c.cgId).filter(Boolean) as string[], [allCoins]);
 
@@ -1628,11 +1648,19 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const rows = await fetchCoinGeckoMarketsBatched(coinIds);
+      const { rows, failedIds } = await fetchCoinGeckoMarketsBatched(coinIds);
       const byId = new Map(rows.map((r) => [r.id, r]));
+      const failedIdSet = new Set(failedIds);
 
       const merged: MarketRow[] = allCoins.map((c) => {
         const r = c.cgId ? byId.get(c.cgId) : undefined;
+        const unavailableReason = !c.cgId
+          ? "No CoinGecko provider ID mapped."
+          : failedIdSet.has(c.cgId)
+            ? "Provider batch failed or rate-limited."
+            : !r
+              ? "Provider returned no market row."
+              : undefined;
         return {
           symbol: c.symbol.toUpperCase(),
           cgId: c.cgId,
@@ -1645,13 +1673,27 @@ export default function App() {
               : typeof r?.price_change_percentage_24h === "number"
                 ? r!.price_change_percentage_24h
                 : undefined,
+          change7d: typeof r?.price_change_percentage_7d_in_currency === "number" ? r!.price_change_percentage_7d_in_currency : undefined,
           volume24hUsd: typeof r?.total_volume === "number" ? r!.total_volume : undefined,
+          marketCapUsd: typeof r?.market_cap === "number" ? r!.market_cap : undefined,
           sparkline: r?.sparkline_in_7d?.price?.filter((x) => typeof x === "number" && isFinite(x) && x > 0),
+          unavailableReason,
         };
       });
 
       setMarket(merged);
       setLastUpdated(Date.now());
+      const unavailable = merged.filter((m) => m.unavailableReason).map((m) => m.symbol);
+      console.info("[Revolut X universe scan]", {
+        totalSymbols: revolutXUniverse.rawSymbolCount,
+        uniqueSymbols: allCoins.length,
+        resolved: merged.length - unavailable.length,
+        unresolved: unavailable.length,
+        unresolvedSymbols: unavailable,
+        duplicateSymbolsRemoved: revolutXUniverse.duplicateSymbolsRemoved,
+        quoteCurrency: revolutXUniverse.quoteCurrency,
+        lastSuccessfulScan: new Date().toISOString(),
+      });
       setPriceHistoryMap((prev) => {
         const next = { ...prev };
         for (const row of merged) {
@@ -1911,6 +1953,7 @@ export default function App() {
             symbol: c.symbol.toUpperCase(),
             cgId: c.cgId,
             name: c.name,
+            unavailableReason: c.cgId ? "Market scan not run yet." : "No CoinGecko provider ID mapped.",
           })),
     [allCoins, market]
   );
@@ -1927,18 +1970,33 @@ export default function App() {
           return hasLivePrice && hasVolume && (change >= 0.8 || freshChange >= 0.25 || priority);
         }).length
       : marketUniverse.length;
-    return { total: allCoins.length, active, live, missing, custom: customRevolutCoins.length };
-  }, [allCoins.length, customRevolutCoins.length, hideFlatCoins, marketUniverse]);
+    return {
+      total: allCoins.length,
+      rawTotal: revolutXUniverse.rawSymbolCount,
+      active,
+      live,
+      missing,
+      resolved: allCoins.length - marketUniverse.filter((m) => m.unavailableReason).length,
+      unresolved: marketUniverse.filter((m) => m.unavailableReason).length,
+      duplicatesRemoved: revolutXUniverse.duplicateSymbolsRemoved.length,
+      quoteCurrency: revolutXUniverse.quoteCurrency,
+      source: revolutXUniverse.source,
+    };
+  }, [allCoins.length, hideFlatCoins, marketUniverse, revolutXUniverse]);
 
   const universeAudit = useMemo(() => {
     const noCgId = allCoins.filter((coin) => !coin.cgId).map((coin) => coin.symbol).sort();
+    const unresolved = marketUniverse
+      .filter((m) => m.unavailableReason)
+      .map((m) => `${m.symbol}: ${m.unavailableReason}`)
+      .sort();
     const noLive = marketUniverse
       .filter((m) => m.cgId && !(typeof m.priceUsd === "number" && isFinite(m.priceUsd)))
       .map((m) => m.symbol)
       .sort();
     const freshMoving = marketUniverse.filter((m) => Math.abs(m.change1h ?? 0) >= 0.25).length;
     const moving24h = marketUniverse.filter((m) => Math.abs(m.change24h ?? 0) >= 0.8).length;
-    return { noCgId, noLive, freshMoving, moving24h };
+    return { noCgId, noLive, unresolved, freshMoving, moving24h };
   }, [allCoins, marketUniverse]);
 
   const filteredMarket = useMemo(() => {
@@ -1982,6 +2040,8 @@ export default function App() {
           priceUsd: m.priceUsd,
           change1h: m.change1h,
           change24h: m.change24h,
+          change7d: m.change7d,
+          marketCapUsd: m.marketCapUsd,
           combinedScore: s.combinedScore,
           dayTradeScore: dayTrade.dayTradeScore,
           score15m: s.score15m,
@@ -2359,6 +2419,8 @@ export default function App() {
       priceUsd: undefined,
       change1h: undefined,
       change24h: undefined,
+      change7d: undefined,
+      marketCapUsd: undefined,
       combinedScore: 0,
       dayTradeScore: 0,
       score15m: 0,
@@ -4224,7 +4286,7 @@ export default function App() {
             <div>
               <div style={{ color: "#0f766e", fontWeight: 900, letterSpacing: 0.8 }}>WATCHLIST (RANKED)</div>
               <div style={{ ...subtle, marginTop: 4 }}>
-                Revolut X active universe: {universeStats.active} shown · {universeStats.total} tracked · custom {universeStats.custom} · live {universeStats.live}
+                Revolut X USD universe: {universeStats.active} shown · {universeStats.total}/{universeStats.rawTotal} unique tracked · live {universeStats.live} · unresolved {universeStats.unresolved}
               </div>
             </div>
             <span style={pill}>Working universe</span>
@@ -4250,15 +4312,18 @@ export default function App() {
               <div>
                 <div style={{ fontWeight: 950, color: "#111827" }}>Revolut universe audit</div>
                 <div style={{ ...subtle, marginTop: 5 }}>
-                  Live {universeStats.live}/{universeStats.total} · no live data {universeAudit.noLive.length} · fresh movers {universeAudit.freshMoving} · 24h movers {universeAudit.moving24h}
+                  USD only · resolved {universeStats.resolved} · unresolved {universeStats.unresolved} · duplicates removed {universeStats.duplicatesRemoved} · fresh movers {universeAudit.freshMoving} · 24h movers {universeAudit.moving24h}
+                </div>
+                <div style={{ ...subtle, marginTop: 5 }}>
+                  Last successful scan: {lastUpdated ? new Date(lastUpdated).toLocaleString() : "not yet"} · Source: {universeStats.source}
                 </div>
               </div>
               <button style={btn} onClick={() => setHideFlatCoins(false)}>Show all tracked</button>
             </div>
-            {universeAudit.noLive.length > 0 && (
+            {universeAudit.unresolved.length > 0 && (
               <div style={{ ...subtle, marginTop: 8 }}>
-                No live price right now: {universeAudit.noLive.slice(0, 18).join(", ")}
-                {universeAudit.noLive.length > 18 ? ` +${universeAudit.noLive.length - 18} more` : ""}
+                Unresolved/unavailable: {universeAudit.unresolved.slice(0, 12).join(" · ")}
+                {universeAudit.unresolved.length > 12 ? ` · +${universeAudit.unresolved.length - 12} more` : ""}
               </div>
             )}
             {universeAudit.noCgId.length > 0 && (
@@ -5793,7 +5858,7 @@ export default function App() {
             <div>
               <div style={sectionTitle}>SCANNER UNIVERSE</div>
               <div style={{ ...subtle, marginTop: 6 }}>
-                Revolut X active universe: {simCoinChoices.length} shown from {universeStats.total} tracked coins. Flat/no-data coins are hidden unless you search.
+                Revolut X USD universe: {simCoinChoices.length} shown from {universeStats.total} tracked coins. Unresolved symbols stay visible when you show all or search.
               </div>
             </div>
             <input
@@ -5815,9 +5880,9 @@ export default function App() {
           </div>
 
           <div style={{ ...statCard, marginTop: 12, background: "#ffffff" }}>
-            <div style={{ fontWeight: 950, color: "#111827" }}>Add missing Revolut X coin</div>
+            <div style={{ fontWeight: 950, color: "#111827" }}>Manual import is disabled for this exact universe</div>
             <div style={{ ...subtle, marginTop: 5 }}>
-              Add the symbol and CoinGecko ID from the coin page URL. Example: SYND uses <b>syndicate</b>; SYN uses <b>synapse-2</b>.
+              The scanner is currently locked to the supplied Revolut X USD screenshot universe. Use the audit above to see unresolved symbols, then update the central config if a provider ID needs correcting.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "0.6fr 1fr 1fr auto", gap: 8, marginTop: 10 }}>
               <input
