@@ -261,6 +261,12 @@ type ScalpSignal = {
   peakRiskScore: number;
   action: "SCALP_TEST" | "WATCH" | "TOO_LATE" | "NO_LIQUIDITY";
   tone: string;
+  gradeLabel: string;
+  gradeDetail: string;
+  expectedMovePct: number;
+  moveBand: "5%+" | "3%" | "1-2%" | "WATCH" | "AVOID";
+  movementRatePctPerHour: number;
+  timeToTarget: string;
   speedLabel: string;
   legsLabel: string;
   stop: number;
@@ -2245,20 +2251,54 @@ export default function App() {
         const pathBonus = pathAware ? (path.label === "LIFTING" ? 16 : path.label === "BUILDING" ? 9 : path.label === "VERTICAL" ? -10 : 0) : 0;
         const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + pathBonus + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
-        const rawTargetPct = stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65);
+        const tapeRatePctPerHour = clamp(Math.max(0, fastMove, path.path1h, path.path4h / 4), 0, 12);
+        const accelerationBonus = clamp(Math.max(0, acceleration) * 0.45, 0, 1.6);
+        const legsMultiplier = clamp(0.7 + legsScore / 100, 0.75, 1.55);
+        const peakDrag = clamp(peakRiskScore / 100, 0, 0.85);
+        const expectedMovePct = clamp((tapeRatePctPerHour * 1.45 + accelerationBonus + Math.max(0, path.path4h) * 0.12) * legsMultiplier * (1 - peakDrag * 0.55), 0, 7.5);
+        const moveBand: ScalpSignal["moveBand"] =
+          tooLate || dumpRisk || peakRisk ? "AVOID" : expectedMovePct >= 5 && legsScore >= 72 && peakRiskScore < 46 ? "5%+" : expectedMovePct >= 3 && legsScore >= 62 && peakRiskScore < 58 ? "3%" : expectedMovePct >= 1 && !rollingOver ? "1-2%" : "WATCH";
+        const gradeLabel =
+          moveBand === "5%+" ? "FAST FAST" : moveBand === "3%" ? "FAST" : moveBand === "1-2%" ? "STABLE" : moveBand === "WATCH" ? "BUILDING" : "AVOID";
+        const gradeDetail =
+          moveBand === "5%+"
+            ? "Possible 5%+ runner if speed holds; use trailing exits."
+            : moveBand === "3%"
+              ? "Possible 3% scalp; wait for clean continuation."
+              : moveBand === "1-2%"
+                ? "Stable smaller scalp; take profit quicker."
+                : moveBand === "WATCH"
+                  ? "Movement building, not confirmed enough."
+                  : "Late/fading; avoid chase entries.";
+        const hoursToExpected = tapeRatePctPerHour > 0.05 && expectedMovePct > 0 ? expectedMovePct / tapeRatePctPerHour : 0;
+        const timeToTarget =
+          moveBand === "AVOID"
+            ? "No entry"
+            : !hoursToExpected
+              ? "Needs speed"
+              : hoursToExpected < 0.25
+                ? "under 15 min"
+                : hoursToExpected < 0.75
+                  ? "15-45 min"
+                  : hoursToExpected < 1.5
+                    ? "45-90 min"
+                    : "1.5h+";
+        const rawTargetPct = Math.max(stopPct * (earlyBurst ? 2.05 : tooLate ? 1.1 : 1.65), moveBand === "5%+" ? Math.min(expectedMovePct, 5.8) : moveBand === "3%" ? Math.min(expectedMovePct, 3.8) : 0);
         const minNetTargetPct = simRevolutXMode ? Math.max(0.95, simRequiredGrossForOneNetPct) : 0.85;
-        const targetPct = clamp(Math.max(rawTargetPct, minNetTargetPct), minNetTargetPct, 4.8);
+        const targetPct = clamp(Math.max(rawTargetPct, minNetTargetPct), minNetTargetPct, moveBand === "5%+" ? 5.8 : 4.8);
         const stop = price ? price * (1 - stopPct / 100) : 0;
         const target = price ? price * (1 + targetPct / 100) : 0;
         const action: ScalpSignal["action"] = !liquidityOk ? "NO_LIQUIDITY" : tooLate ? "TOO_LATE" : burstScore >= 68 && legsScore >= 58 && continuationOk && (earlyBurst || microContinuation || pathBreakout || pathStillHasLegs) ? "SCALP_TEST" : burstScore >= 50 || warming || freshWatch ? "WATCH" : "NO_LIQUIDITY";
         const tone = action === "SCALP_TEST" ? "#047857" : action === "TOO_LATE" ? "#b91c1c" : "#92400e";
         const speedLabel = hasMicro ? (rollingOver ? "FADING" : earlyBurst ? "EARLY BURST" : continuationOk ? "ACCELERATING" : "WATCHING") : freshWatch ? "FRESH WATCH" : "NEEDS MICRO";
         const legsLabel = peakRiskScore >= 58 ? "PEAK RISK" : legsScore >= 70 && continuationOk ? "HAS LEGS" : legsScore >= 50 && !rollingOver ? "MAYBE LEGS" : "NO LEGS";
-        const holdWindow = action === "SCALP_TEST" ? (earlyBurst ? "2 to 12 minutes. Take profit fast or trail manually." : "3 to 20 minutes, exit at stop/target or if momentum fades.") : "Wait for a cleaner burst; do not force entry.";
+        const holdWindow = action === "SCALP_TEST" ? `${timeToTarget}. ${moveBand === "5%+" ? "Trail manually; do not give back a runner." : moveBand === "3%" ? "Take partials quickly if momentum stalls." : "Fast take-profit lane; do not overstay."}` : "Wait for a cleaner burst; do not force entry.";
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
           `Burst score ${burstScore}/100`,
+          `${gradeLabel} ${moveBand} est ${expectedMovePct.toFixed(2)}%`,
           hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : hasFreshTape ? `CG 1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
+          `Rate ${tapeRatePctPerHour.toFixed(2)}%/h`,
           `Accel ${acceleration >= 0 ? "+" : ""}${acceleration.toFixed(2)}`,
           pathAware ? `Path ${path.label} ${path.stairScore}/100` : "Path loading",
           `Legs ${legsScore}/100`,
@@ -2279,7 +2319,7 @@ export default function App() {
         if (!activeEnough) warnings.push("No useful movement right now; hidden from active scalp mode unless searched.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
-        return { symbol: s.symbol, price, burstScore, legsScore, peakRiskScore, action, tone, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
+        return { symbol: s.symbol, price, burstScore, legsScore, peakRiskScore, action, tone, gradeLabel, gradeDetail, expectedMovePct, moveBand, movementRatePctPerHour: tapeRatePctPerHour, timeToTarget, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
       })
       .filter((s) => s.price > 0)
       .filter((s) => !hideFlatCoins || s.action !== "NO_LIQUIDITY")
@@ -2308,7 +2348,7 @@ export default function App() {
           symbol: signal.symbol,
           kind: "FAST_SPIKE",
           title: `${signal.symbol} fresh move`,
-          detail: `${freshPct.toFixed(2)}% fresh 1h move. ${signal.action === "SCALP_TEST" ? "Scalp-confirmed" : "Watch only until confirmation"} · Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}.`,
+          detail: `${freshPct.toFixed(2)}% fresh 1h move. ${signal.gradeLabel} ${signal.moveBand} · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. ${signal.action === "SCALP_TEST" ? "Scalp-confirmed" : "Watch only until confirmation"} · Burst ${signal.burstScore}/100.`,
           tone: "#047857",
           score: Math.round(signal.burstScore + freshPct * 6),
         });
@@ -2339,7 +2379,7 @@ export default function App() {
             symbol: signal.symbol,
             kind: "SCALP_TEST",
             title: `${signal.symbol} scalp test`,
-            detail: `Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}. Hold window: ${signal.holdWindow}`,
+            detail: `${signal.gradeLabel} ${signal.moveBand} · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}. Hold window: ${signal.holdWindow}`,
             tone: signal.tone,
             score: signal.burstScore,
           });
@@ -5549,10 +5589,27 @@ export default function App() {
                   </div>
                   <span style={{ ...pill, color: signal.tone }}>{signal.burstScore}/100</span>
                 </div>
-                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>{signal.action.replace("_", " ")} · {signal.speedLabel} · {signal.legsLabel}</div>
+                <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>
+                  {signal.gradeLabel} · {signal.moveBand} · {signal.action.replace("_", " ")}
+                </div>
+                <div style={{ ...subtle, marginTop: 4 }}>{signal.gradeDetail}</div>
                 <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
                 {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={subtle}>Est Move</div>
+                    <div style={{ fontWeight: 900, color: signal.moveBand === "AVOID" ? "#b91c1c" : signal.moveBand === "5%+" ? "#047857" : "#111827" }}>
+                      {signal.expectedMovePct.toFixed(2)}%
+                    </div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Time</div>
+                    <div style={{ fontWeight: 900, color: "#111827" }}>{signal.timeToTarget}</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Rate</div>
+                    <div style={{ fontWeight: 900, color: "#111827" }}>{signal.movementRatePctPerHour.toFixed(2)}%/h</div>
+                  </div>
                   <div>
                     <div style={subtle}>Legs</div>
                     <div style={{ fontWeight: 900, color: signal.legsScore >= 55 ? "#047857" : "#b91c1c" }}>{signal.legsScore}</div>
@@ -5581,7 +5638,7 @@ export default function App() {
                     setSimStopLossInput(signal.stop.toPrecision(8));
                     setSimTakeProfitInput(signal.target.toPrecision(8));
                     setSimBuyUsd(String(signal.suggestedUsd || 50));
-                    setSimThesis(`Quick scalp ${signal.speedLabel} ${signal.legsLabel}: legs ${signal.legsScore}/100, peak risk ${signal.peakRiskScore}/100. ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
+                    setSimThesis(`Quick scalp ${signal.gradeLabel} ${signal.moveBand}: estimated move ${signal.expectedMovePct.toFixed(2)}% over ${signal.timeToTarget}, rate ${signal.movementRatePctPerHour.toFixed(2)}%/h. ${signal.speedLabel} ${signal.legsLabel}: legs ${signal.legsScore}/100, peak risk ${signal.peakRiskScore}/100. ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
                   }}
                 >
                   Load Scalp Ticket
@@ -5676,7 +5733,21 @@ export default function App() {
             {simTradeMode === "SCALP" && selectedScalpSignal && (
               <div style={{ ...statCard, marginTop: 10, background: "#ffffff", borderColor: selectedScalpSignal.action === "SCALP_TEST" ? "#99f6e4" : "#fed7aa" }}>
                 <div style={{ fontWeight: 950, color: selectedScalpSignal.tone }}>
-                  Burst: {selectedScalpSignal.action.replace("_", " ")} · {selectedScalpSignal.burstScore}/100
+                  {selectedScalpSignal.gradeLabel} · {selectedScalpSignal.moveBand} · {selectedScalpSignal.action.replace("_", " ")}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginTop: 8 }}>
+                  <div>
+                    <div style={subtle}>Est move</div>
+                    <div style={{ fontWeight: 950, color: selectedScalpSignal.tone }}>{selectedScalpSignal.expectedMovePct.toFixed(2)}%</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Rate</div>
+                    <div style={{ fontWeight: 950 }}>{selectedScalpSignal.movementRatePctPerHour.toFixed(2)}%/h</div>
+                  </div>
+                  <div>
+                    <div style={subtle}>Window</div>
+                    <div style={{ fontWeight: 950 }}>{selectedScalpSignal.timeToTarget}</div>
+                  </div>
                 </div>
                 <div style={{ ...subtle, marginTop: 6 }}>{selectedScalpSignal.holdWindow}</div>
               </div>
