@@ -757,6 +757,51 @@ function scoreDayTradeSetup(row: MarketRow, base: ReturnType<typeof scoreSetup>,
   return { dayTradeScore, scalpBias, why };
 }
 
+function applyReadinessScoreCap(
+  rawScore: number,
+  entryQuality: SetupRow["entryQuality"],
+  structureLabel: SetupRow["structureLabel"],
+  pathLabel: PathMomentum["label"],
+  verticalRisk: number
+) {
+  const caps: number[] = [100];
+  const reasons: string[] = [];
+
+  if (entryQuality === "NO_EDGE") {
+    caps.push(35);
+    reasons.push("entry NO_EDGE");
+  } else if (entryQuality === "EXTENDED") {
+    caps.push(58);
+    reasons.push("entry EXTENDED");
+  }
+
+  if (structureLabel === "NO_EDGE") {
+    caps.push(35);
+    reasons.push("structure NO_EDGE");
+  } else if (structureLabel === "WAIT") {
+    caps.push(56);
+    reasons.push("structure WAIT");
+  }
+
+  if (pathLabel === "VERTICAL") {
+    caps.push(54);
+    reasons.push("vertical chart");
+  } else if (verticalRisk >= 72) {
+    caps.push(52);
+    reasons.push("high vertical risk");
+  } else if (verticalRisk >= 62) {
+    caps.push(64);
+    reasons.push("elevated vertical risk");
+  }
+
+  const cap = Math.min(...caps);
+  return {
+    score: Math.round(Math.min(rawScore, cap)),
+    cap,
+    reasons,
+  };
+}
+
 /** Compute R multiple */
 function computeR(side: "LONG" | "SHORT", entry: number, stop: number, exit: number) {
   if (![entry, stop, exit].every((x) => typeof x === "number" && isFinite(x))) return NaN;
@@ -2048,6 +2093,12 @@ export default function App() {
         const path = computePathMomentum(priceHistoryMap[m.symbol] ?? []);
         const dayTrade = scoreDayTradeSetup(m, s, micro, path);
         const st = structMap[m.symbol];
+        const entryQuality = micro?.entryQuality ?? "VALID";
+        const structureLabel = st?.label ?? "WAIT";
+        const readiness = applyReadinessScoreCap(dayTrade.dayTradeScore, entryQuality, structureLabel, path.label, path.verticalRisk);
+        const readinessWhy = readiness.reasons.length
+          ? [`Score capped at ${readiness.cap}/100: ${readiness.reasons.join(", ")}.`]
+          : [];
 
         return {
           symbol: m.symbol,
@@ -2057,13 +2108,13 @@ export default function App() {
           change7d: m.change7d,
           marketCapUsd: m.marketCapUsd,
           combinedScore: s.combinedScore,
-          dayTradeScore: dayTrade.dayTradeScore,
+          dayTradeScore: readiness.score,
           score15m: s.score15m,
           score1h: s.score1h,
           volFactor: s.volFactor,
-          why: [...dayTrade.why, ...s.why],
+          why: [...readinessWhy, ...dayTrade.why, ...s.why],
 
-          entryQuality: micro?.entryQuality ?? "VALID",
+          entryQuality,
           whyNot: micro?.whyNot ?? [],
           ret1h: micro?.ret1h,
           ret4h: micro?.ret4h,
@@ -2074,9 +2125,9 @@ export default function App() {
           path24h: path.path24h,
           pathLabel: path.label,
           verticalRisk: path.verticalRisk,
-          scalpBias: dayTrade.scalpBias,
+          scalpBias: entryQuality !== "VALID" || structureLabel !== "OK" || path.label === "VERTICAL" || path.verticalRisk >= 72 ? "AVOID" : dayTrade.scalpBias,
 
-          structureLabel: st?.label ?? "WAIT",
+          structureLabel,
           structureWhy: st?.reasons ?? (st ? [] : ["Structure not loaded yet."]),
           support: st?.support,
           resistance: st?.resistance,
