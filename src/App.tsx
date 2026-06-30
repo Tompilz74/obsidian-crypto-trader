@@ -257,6 +257,14 @@ type ScalpSignal = {
   symbol: string;
   price: number;
   burstScore: number;
+  gradeScore: number;
+  gradeComponents: {
+    speed: number;
+    acceleration: number;
+    continuation: number;
+    risk: number;
+    liquidity: number;
+  };
   legsScore: number;
   peakRiskScore: number;
   action: "SCALP_TEST" | "WATCH" | "TOO_LATE" | "NO_LIQUIDITY";
@@ -2252,12 +2260,48 @@ export default function App() {
         const burstScore = Math.round(clamp(momentumScore * 0.58 + volumeScore * 0.25 + legsScore * 0.17 + (earlyBurst ? 12 : warming ? 6 : 0) + pathBonus + freshnessBonus - (tooLate ? 30 : 0) - (dumpRisk ? 22 : 0) - structurePenalty, 0, 100));
         const stopPct = clamp(Math.max(0.45, Math.min(1.55, Math.abs(fastMove) * 0.18 + Math.abs(move4h) * 0.045)), 0.45, 1.55);
         const tapeRatePctPerHour = clamp(Math.max(0, fastMove, path.path1h, path.path4h / 4), 0, 12);
-        const accelerationBonus = clamp(Math.max(0, acceleration) * 0.45, 0, 1.6);
-        const legsMultiplier = clamp(0.7 + legsScore / 100, 0.75, 1.55);
-        const peakDrag = clamp(peakRiskScore / 100, 0, 0.85);
-        const expectedMovePct = clamp((tapeRatePctPerHour * 1.45 + accelerationBonus + Math.max(0, path.path4h) * 0.12) * legsMultiplier * (1 - peakDrag * 0.55), 0, 7.5);
+        const speedScore = Math.round(clamp(tapeRatePctPerHour * 18 + Math.max(0, path.path4h) * 2, 0, 100));
+        const accelerationScore = Math.round(clamp(48 + acceleration * 30 + (fastMove > 0 ? 8 : -16), 0, 100));
+        const continuationScore = Math.round(clamp(legsScore * 0.5 + path.stairScore * 0.32 + Math.max(0, path.slopeLift) * 18 + (continuationOk ? 14 : -18), 0, 100));
+        const riskControlScore = Math.round(clamp(100 - peakRiskScore - (rollingOver ? 24 : 0) - (dumpRisk ? 22 : 0) - (path.label === "VERTICAL" ? 16 : 0), 0, 100));
+        const liquidityScore = Math.round(clamp(42 + Math.log10(Math.max(1, s.volFactor)) * 34 + (price > 0 ? 12 : -30), 0, 100));
+        const gradeScore = Math.round(clamp(
+          speedScore * 0.24 +
+            accelerationScore * 0.18 +
+            continuationScore * 0.26 +
+            riskControlScore * 0.22 +
+            liquidityScore * 0.1 -
+            structurePenalty * 0.7,
+          0,
+          100
+        ));
+        const gradeComponents = {
+          speed: speedScore,
+          acceleration: accelerationScore,
+          continuation: continuationScore,
+          risk: riskControlScore,
+          liquidity: liquidityScore,
+        };
+        const targetPotentialPct = clamp(
+          tapeRatePctPerHour * 0.85 +
+            Math.max(0, acceleration) * 0.65 +
+            Math.max(0, path.path4h) * 0.18 +
+            Math.max(0, path.slopeLift) * 0.55,
+          0,
+          8
+        );
+        const gradeMultiplier = clamp((gradeScore - 38) / 42, 0, 1.25);
+        const expectedMovePct = clamp(targetPotentialPct * gradeMultiplier, 0, 7.5);
         const moveBand: ScalpSignal["moveBand"] =
-          tooLate || dumpRisk || peakRisk ? "AVOID" : expectedMovePct >= 5 && legsScore >= 72 && peakRiskScore < 46 ? "5%+" : expectedMovePct >= 3 && legsScore >= 62 && peakRiskScore < 58 ? "3%" : expectedMovePct >= 1 && !rollingOver ? "1-2%" : "WATCH";
+          tooLate || dumpRisk || peakRisk || riskControlScore < 42
+            ? "AVOID"
+            : gradeScore >= 86 && expectedMovePct >= 4.8 && speedScore >= 72 && continuationScore >= 72 && riskControlScore >= 62
+              ? "5%+"
+              : gradeScore >= 74 && expectedMovePct >= 2.7 && speedScore >= 55 && continuationScore >= 62 && riskControlScore >= 55
+                ? "3%"
+                : gradeScore >= 58 && expectedMovePct >= 0.9 && !rollingOver && riskControlScore >= 48
+                  ? "1-2%"
+                  : "WATCH";
         const gradeLabel =
           moveBand === "5%+" ? "FAST FAST" : moveBand === "3%" ? "FAST" : moveBand === "1-2%" ? "STABLE" : moveBand === "WATCH" ? "BUILDING" : "AVOID";
         const gradeDetail =
@@ -2295,7 +2339,7 @@ export default function App() {
         const holdWindow = action === "SCALP_TEST" ? `${timeToTarget}. ${moveBand === "5%+" ? "Trail manually; do not give back a runner." : moveBand === "3%" ? "Take partials quickly if momentum stalls." : "Fast take-profit lane; do not overstay."}` : "Wait for a cleaner burst; do not force entry.";
         const suggestedUsd = action === "SCALP_TEST" ? Math.max(25, Math.min(simState.cashUsd, Math.round(simState.cashUsd * (earlyBurst ? 0.07 : 0.05)), earlyBurst ? 140 : 100)) : 0;
         const reasons = [
-          `Burst score ${burstScore}/100`,
+          `Grade ${gradeScore}/100`,
           `${gradeLabel} ${moveBand} est ${expectedMovePct.toFixed(2)}%`,
           hasMicro ? `1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : hasFreshTape ? `CG 1h ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%` : `24h proxy ${fastMove >= 0 ? "+" : ""}${fastMove.toFixed(2)}%`,
           `Rate ${tapeRatePctPerHour.toFixed(2)}%/h`,
@@ -2319,11 +2363,11 @@ export default function App() {
         if (!activeEnough) warnings.push("No useful movement right now; hidden from active scalp mode unless searched.");
         if (!liquidityOk) warnings.push("Not enough live price/volume confirmation for quick scalp.");
         if (s.structureLabel === "NO_EDGE") warnings.push("Structure engine says no clean edge.");
-        return { symbol: s.symbol, price, burstScore, legsScore, peakRiskScore, action, tone, gradeLabel, gradeDetail, expectedMovePct, moveBand, movementRatePctPerHour: tapeRatePctPerHour, timeToTarget, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
+        return { symbol: s.symbol, price, burstScore, gradeScore, gradeComponents, legsScore, peakRiskScore, action, tone, gradeLabel, gradeDetail, expectedMovePct, moveBand, movementRatePctPerHour: tapeRatePctPerHour, timeToTarget, speedLabel, legsLabel, stop, target, holdWindow, suggestedUsd, reasons, warnings, setup: s };
       })
       .filter((s) => s.price > 0)
       .filter((s) => !hideFlatCoins || s.action !== "NO_LIQUIDITY")
-      .sort((a, b) => b.burstScore - a.burstScore)
+      .sort((a, b) => b.gradeScore - a.gradeScore || b.burstScore - a.burstScore)
       .slice(0, 20);
   }, [getSimPrice, hideFlatCoins, priceHistoryMap, setups, simRequiredGrossForOneNetPct, simRevolutXMode, simState.cashUsd]);
   const selectedScalpSignal = scalpSignals.find((s) => s.symbol === simSymbol);
@@ -2348,7 +2392,7 @@ export default function App() {
           symbol: signal.symbol,
           kind: "FAST_SPIKE",
           title: `${signal.symbol} fresh move`,
-          detail: `${freshPct.toFixed(2)}% fresh 1h move. ${signal.gradeLabel} ${signal.moveBand} · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. ${signal.action === "SCALP_TEST" ? "Scalp-confirmed" : "Watch only until confirmation"} · Burst ${signal.burstScore}/100.`,
+          detail: `${freshPct.toFixed(2)}% fresh 1h move. ${signal.gradeLabel} ${signal.moveBand} · grade ${signal.gradeScore}/100 · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. ${signal.action === "SCALP_TEST" ? "Scalp-confirmed" : "Watch only until confirmation"}.`,
           tone: "#047857",
           score: Math.round(signal.burstScore + freshPct * 6),
         });
@@ -2379,7 +2423,7 @@ export default function App() {
             symbol: signal.symbol,
             kind: "SCALP_TEST",
             title: `${signal.symbol} scalp test`,
-            detail: `${signal.gradeLabel} ${signal.moveBand} · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. Burst ${signal.burstScore}/100 · ${signal.speedLabel} · ${signal.legsLabel}. Hold window: ${signal.holdWindow}`,
+            detail: `${signal.gradeLabel} ${signal.moveBand} · grade ${signal.gradeScore}/100 · est ${signal.expectedMovePct.toFixed(2)}% · ${signal.timeToTarget}. ${signal.speedLabel} · ${signal.legsLabel}. Hold window: ${signal.holdWindow}`,
             tone: signal.tone,
             score: signal.burstScore,
           });
@@ -5587,13 +5631,26 @@ export default function App() {
                     <div style={{ fontWeight: 950, color: "#111827" }}>{signal.symbol}</div>
                     <div style={{ ...subtle, marginTop: 4 }}>{fmtUsd(signal.price)}</div>
                   </div>
-                  <span style={{ ...pill, color: signal.tone }}>{signal.burstScore}/100</span>
+                  <span style={{ ...pill, color: signal.tone }}>{signal.gradeScore}/100</span>
                 </div>
                 <div style={{ marginTop: 10, fontWeight: 950, color: signal.tone }}>
                   {signal.gradeLabel} · {signal.moveBand} · {signal.action.replace("_", " ")}
                 </div>
                 <div style={{ ...subtle, marginTop: 4 }}>{signal.gradeDetail}</div>
                 <div style={{ ...subtle, marginTop: 6 }}>{signal.reasons.join(" · ")}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 4, marginTop: 8 }}>
+                  {[
+                    ["Spd", signal.gradeComponents.speed],
+                    ["Acc", signal.gradeComponents.acceleration],
+                    ["Leg", signal.gradeComponents.continuation],
+                    ["Risk", signal.gradeComponents.risk],
+                    ["Liq", signal.gradeComponents.liquidity],
+                  ].map(([label, value]) => (
+                    <div key={label} style={{ ...pill, padding: "4px 5px", justifyContent: "center", color: Number(value) >= 65 ? "#047857" : Number(value) >= 48 ? "#92400e" : "#b91c1c" }}>
+                      {label} {value}
+                    </div>
+                  ))}
+                </div>
                 {signal.warnings.length > 0 && <div style={{ ...subtle, marginTop: 6, color: "#92400e" }}>{signal.warnings[0]}</div>}
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
                   <div>
@@ -5638,7 +5695,7 @@ export default function App() {
                     setSimStopLossInput(signal.stop.toPrecision(8));
                     setSimTakeProfitInput(signal.target.toPrecision(8));
                     setSimBuyUsd(String(signal.suggestedUsd || 50));
-                    setSimThesis(`Quick scalp ${signal.gradeLabel} ${signal.moveBand}: estimated move ${signal.expectedMovePct.toFixed(2)}% over ${signal.timeToTarget}, rate ${signal.movementRatePctPerHour.toFixed(2)}%/h. ${signal.speedLabel} ${signal.legsLabel}: legs ${signal.legsScore}/100, peak risk ${signal.peakRiskScore}/100. ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
+                    setSimThesis(`Quick scalp ${signal.gradeLabel} ${signal.moveBand}: grade ${signal.gradeScore}/100, estimated move ${signal.expectedMovePct.toFixed(2)}% over ${signal.timeToTarget}, rate ${signal.movementRatePctPerHour.toFixed(2)}%/h. Components speed ${signal.gradeComponents.speed}, acceleration ${signal.gradeComponents.acceleration}, continuation ${signal.gradeComponents.continuation}, risk ${signal.gradeComponents.risk}, liquidity ${signal.gradeComponents.liquidity}. ${signal.speedLabel} ${signal.legsLabel}: peak risk ${signal.peakRiskScore}/100. ${signal.reasons.join(" ")} ${signal.warnings.join(" ")}`);
                   }}
                 >
                   Load Scalp Ticket
@@ -5748,6 +5805,19 @@ export default function App() {
                     <div style={subtle}>Window</div>
                     <div style={{ fontWeight: 950 }}>{selectedScalpSignal.timeToTarget}</div>
                   </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 5, marginTop: 8 }}>
+                  {[
+                    ["Spd", selectedScalpSignal.gradeComponents.speed],
+                    ["Acc", selectedScalpSignal.gradeComponents.acceleration],
+                    ["Leg", selectedScalpSignal.gradeComponents.continuation],
+                    ["Risk", selectedScalpSignal.gradeComponents.risk],
+                    ["Liq", selectedScalpSignal.gradeComponents.liquidity],
+                  ].map(([label, value]) => (
+                    <div key={label} style={{ ...pill, padding: "4px 5px", justifyContent: "center", color: Number(value) >= 65 ? "#047857" : Number(value) >= 48 ? "#92400e" : "#b91c1c" }}>
+                      {label} {value}
+                    </div>
+                  ))}
                 </div>
                 <div style={{ ...subtle, marginTop: 6 }}>{selectedScalpSignal.holdWindow}</div>
               </div>
